@@ -3,63 +3,51 @@ pragma solidity ^0.8.17;
 
 import "./IVault.sol";
 import "./IPriceFeed.sol";
-import "./IReferral.sol";
 
-struct Dual {
-  uint256 id;
-  uint256 tariffId;
-  address user;
-  address baseToken;
-  address quoteToken;
-  address inputToken;
-  uint256 inputAmount;
-  uint256 inputBaseAmount;
-  uint256 inputQuoteAmount;
-  address outputToken;
-  uint256 outputAmount;
-  uint256 stakingPeriod;
-  uint256 yield;
-  uint256 initialPrice;
-  uint256 closedPrice;
-  bool claimed;
-  uint256 startedAt;
-  uint256 finishAt;
-}
+  struct Dual {
+    uint256 id;
+    uint256 tariffId;
+    address user;
+    address baseToken;
+    address quoteToken;
+    address inputToken;
+    uint256 inputAmount;
+    uint256 inputBaseAmount;
+    uint256 inputQuoteAmount;
+    address outputToken;
+    uint256 outputAmount;
+    uint256 stakingPeriod;
+    uint256 yield;
+    uint256 initialPrice;
+    uint256 closedPrice;
+    bool claimed;
+    uint256 startedAt;
+    uint256 finishAt;
+  }
 
-struct DualTariff {
-  uint256 id;
-  address baseToken;
-  address quoteToken;
-  uint256 stakingPeriod;
-  uint256 yield;
-  bool enabled;
-}
-
-struct Limit {
-  uint256 minAmount;
-  uint256 maxAmount;
-}
-
-struct TokenLimit {
-  address token;
-  uint256 minAmount;
-  uint256 maxAmount;
-}
+  struct DualTariff {
+    uint256 id;
+    address baseToken;
+    address quoteToken;
+    uint256 minBaseAmount;
+    uint256 maxBaseAmount;
+    uint256 minQuoteAmount;
+    uint256 maxQuoteAmount;
+    uint256 stakingPeriod;
+    uint256 yield;
+    bool enabled;
+  }
 
 interface IDualFactory {
   event DualCreated(uint256 id);
   event DualClaimed(uint256 id);
   event DualReplayed(uint256 id);
+  event PriceFeedUpdated(address oldPriceFeed, address newPriceFeed);
+  event VaultUpdated(address oldVault, address newVault);
 
-  function create(
-    uint256 tariffId,
-    address _user,
-    address inputToken,
-    uint256 inputAmount,
-    address inviterAddress
-  ) external;
+  function create(uint256 tariffId, address _user, address inputToken, uint256 inputAmount) external;
 
-  function createETH(uint256 tariffId, address inviterAddress) external payable;
+  function createETH(uint256 tariffId) external payable;
 
   function replay(uint256 id, uint256 tariffId, uint80 baseRoundId, uint80 quoteRoundId) external;
 
@@ -89,10 +77,6 @@ interface IDualFactory {
 
   function tariffs() external view returns (DualTariff[] memory);
 
-  function updateLimits(address token, Limit calldata _limits) external;
-
-  function limits() external view returns (TokenLimit[] memory tokenLimits);
-
   function enable() external;
 
   function disable() external;
@@ -100,6 +84,4 @@ interface IDualFactory {
   function updateVault(IVault _vault) external;
 
   function updatePriceFeed(IPriceFeed _priceFeed) external;
-
-  function updateReferral(IReferral _referral) external;
 }

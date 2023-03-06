@@ -2,7 +2,7 @@
 import {expect} from "chai";
 import {ethers} from "hardhat";
 import {time, loadFixture} from "@nomicfoundation/hardhat-network-helpers";
-import {Referral, Token, Vault, DualFactory, MockV3Aggregator, PriceFeed, WETH} from "../typechain-types";
+import {Token, Vault, DualFactory, MockV3Aggregator, PriceFeed, WETH} from "../typechain-types";
 import {SignerWithAddress} from "@nomiclabs/hardhat-ethers/signers";
 
 const {BigNumber} = ethers;
@@ -14,11 +14,12 @@ const e18 = BigNumber.from(10).pow(18);
 
 describe("dual", () => {
   async function deploy() {
-    const [owner, user, inviterAddress, inviterAddress1, inviterAddress2] = await ethers.getSigners();
+    const [owner, user, anotherAddress] = await ethers.getSigners();
 
     const Token = await ethers.getContractFactory("Token");
     const btc = await Token.deploy("BTCB Token", "BTCB", 18);
     const usdt = await Token.deploy("Tether USD", "USDT", 6);
+    const gmt = await Token.deploy("GMT", "GMT", 8);
 
     const WETH = await ethers.getContractFactory("WETH");
     const weth = await WETH.deploy();
@@ -28,6 +29,7 @@ describe("dual", () => {
     const aggregatorBTC = await V3Aggregator.deploy(AGGREGATOR_DECIMALS, 20000 * 1e8);
     const aggregatorWETH = await V3Aggregator.deploy(AGGREGATOR_DECIMALS, 1300 * 1e8);
     const aggregatorUSDT = await V3Aggregator.deploy(AGGREGATOR_DECIMALS, 1e8);
+    const aggregatorGMT = await V3Aggregator.deploy(AGGREGATOR_DECIMALS, 0.5 * 1e8);
 
     const Vault = await ethers.getContractFactory("Vault");
     const vault = await Vault.deploy(weth.address);
@@ -38,51 +40,32 @@ describe("dual", () => {
     await priceFeed.updateAggregator(btc.address, aggregatorBTC.address);
     await priceFeed.updateAggregator(weth.address, aggregatorWETH.address);
     await priceFeed.updateAggregator(usdt.address, aggregatorUSDT.address);
-
-    const Referral = await ethers.getContractFactory("Referral");
-    const referral = await Referral.deploy(vault.address, usdt.address);
+    await priceFeed.updateAggregator(gmt.address, aggregatorGMT.address);
 
     const Dual = await ethers.getContractFactory("DualFactory");
-    const dual = await Dual.deploy(vault.address, priceFeed.address, referral.address, weth.address, usdt.address);
+    const dual = await Dual.deploy(vault.address, priceFeed.address, weth.address);
 
-    await referral.grantRole(await referral.DEFAULT_ADMIN_ROLE(), dual.address);
-    await vault.grantRole(await referral.DEFAULT_ADMIN_ROLE(), dual.address);
-
-    await dual.updateLimits(btc.address, {
-      minAmount: e18.div(100),
-      maxAmount: e18.mul(5),
-    });
-
-    await dual.updateLimits(usdt.address, {
-      minAmount: 100 * 1e6,
-      maxAmount: 50000 * 1e6,
-    });
-
-    await dual.updateLimits(weth.address, {
-      minAmount: e18.div(10),
-      maxAmount: e18.mul(50),
-    });
+    await vault.grantRole(await vault.DEFAULT_ADMIN_ROLE(), dual.address);
 
     return {
       dual: dual as DualFactory,
       vault: vault as Vault,
-      referral: referral as Referral,
       priceFeed: priceFeed as PriceFeed,
 
       btc: btc as Token,
       weth: weth as WETH,
       usdt: usdt as Token,
+      gmt: gmt as Token,
 
       owner,
       user,
 
-      inviterAddress,
-      inviterAddress1,
-      inviterAddress2,
+      anotherAddress,
 
       aggregatorBTC: aggregatorBTC as MockV3Aggregator,
       aggregatorWETH: aggregatorWETH as MockV3Aggregator,
       aggregatorUSDT: aggregatorUSDT as MockV3Aggregator,
+      aggregatorGMT: aggregatorGMT as MockV3Aggregator,
     };
   }
 
@@ -96,41 +79,26 @@ describe("dual", () => {
     });
   });
 
-  describe("limits", () => {
-    it("get", async () => {
-      const {dual, btc, usdt, weth} = await loadFixture(deploy);
-
-      const limits = await dual.limits();
-
-      expect(limits.length).eq(3);
-      expect(limits[0].token).eq(btc.address);
-      expect(limits[0].minAmount).eq(e18.div(100));
-      expect(limits[0].maxAmount).eq(e18.mul(5));
-      expect(limits[1].token).eq(usdt.address);
-      expect(limits[1].minAmount).eq(100 * 1e6);
-      expect(limits[1].maxAmount).eq(50000 * 1e6);
-      expect(limits[2].token).eq(weth.address);
-      expect(limits[2].minAmount).eq(e18.div(10));
-      expect(limits[2].maxAmount).eq(e18.mul(50));
-    });
-  });
-
   describe("validate", () => {
     let dual: DualFactory;
     let vault: Vault;
     let btc: Token;
     let usdt: Token;
     let user: SignerWithAddress;
-    let inviterAddress: SignerWithAddress;
+    let anotherAddress: SignerWithAddress;
 
     before(async () => {
-      ({dual, vault, btc, usdt, user, inviterAddress} = await loadFixture(deploy));
+      ({dual, vault, btc, usdt, user, anotherAddress} = await loadFixture(deploy));
 
       await vault.updateThreshold(btc.address, e18);
 
       await dual.addTariff({
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: true,
@@ -141,38 +109,38 @@ describe("dual", () => {
       await btc.connect(user).approve(vault.address, e18);
     });
 
-    it("less than min amount", async () => {
-      await dual.updateLimits(btc.address, {
-        minAmount: e18.div(100),
-        maxAmount: e18.mul(5),
-      });
-
-      await expect(
-        dual.connect(user).create(0, user.address, btc.address, e18.div(101), inviterAddress.address),
-      ).revertedWith("Dual: Too small input amount");
+    it("baseToken amount less than min amount", async () => {
+      await expect(dual.connect(user).create(0, user.address, btc.address, e18.div(101))).revertedWith(
+        "Dual: Too small input amount",
+      );
     });
 
-    it("greater than max amount", async () => {
-      await dual.updateLimits(btc.address, {
-        minAmount: e18.div(100),
-        maxAmount: e18.mul(5),
-      });
+    it("baseToken amount greater than max amount", async () => {
+      await expect(dual.connect(user).create(0, user.address, btc.address, e18.mul(6))).revertedWith(
+        "Dual: Exceeds maximum input amount",
+      );
+    });
 
-      await expect(
-        dual.connect(user).create(0, user.address, btc.address, e18.mul(6), inviterAddress.address),
-      ).revertedWith("Dual: Exceeds maximum input amount");
+    it("quoteToken amount less than min amount", async () => {
+      await expect(dual.connect(user).create(0, user.address, usdt.address, 1e6)).revertedWith(
+        "Dual: Too small input amount",
+      );
+    });
+
+    it("quoteToken amount greater than max amount", async () => {
+      await expect(dual.connect(user).create(0, user.address, usdt.address, 60000 * 1e6)).revertedWith(
+        "Dual: Exceeds maximum input amount",
+      );
     });
 
     it("tariff disabled", async () => {
       await dual.disableTariff(0);
-      await expect(dual.create(0, user.address, btc.address, e18, inviterAddress.address)).revertedWith(
-        "Dual: Tariff does not exist",
-      );
+      await expect(dual.create(0, user.address, btc.address, e18)).revertedWith("Dual: Tariff does not exist");
     });
 
     it("dual disabled", async () => {
       await dual.disable();
-      await expect(dual.create(0, user.address, btc.address, e18, inviterAddress.address)).revertedWith(
+      await expect(dual.create(0, user.address, btc.address, e18)).revertedWith(
         "Dual: Creating new duals is unavailable now",
       );
     });
@@ -184,18 +152,22 @@ describe("dual", () => {
     let btc: Token;
     let usdt: Token;
     let user: SignerWithAddress;
-    let inviterAddress: SignerWithAddress;
+    let anotherAddress: SignerWithAddress;
     let aggregatorBTC: MockV3Aggregator;
 
     describe("only user or admin", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -207,7 +179,7 @@ describe("dual", () => {
         await btc.transfer(user.address, e18);
         await btc.connect(user).approve(vault.address, e18);
 
-        await expect(dual.connect(inviterAddress).create(0, user.address, btc.address, e18, user.address)).revertedWith(
+        await expect(dual.connect(anotherAddress).create(0, user.address, btc.address, e18)).revertedWith(
           "Dual: Not Allowed",
         );
       });
@@ -216,36 +188,40 @@ describe("dual", () => {
         await btc.transfer(user.address, e18);
         await btc.connect(user).approve(vault.address, e18);
 
-        await dual.connect(user).create(0, user.address, btc.address, e18, user.address);
+        await dual.connect(user).create(0, user.address, btc.address, e18);
 
         await aggregatorBTC.updateAnswer(21000 * 1e8);
         await time.increase(12 * 60 * 60);
 
-        await expect(dual.connect(inviterAddress).claim(0, 2, 1)).revertedWith("Dual: Access denied");
+        await expect(dual.connect(anotherAddress).claim(0, 2, 1)).revertedWith("Dual: Access denied");
       });
 
       it("forbidden replay from another user or admin", async () => {
         await btc.transfer(user.address, e18);
         await btc.connect(user).approve(vault.address, e18);
 
-        await dual.connect(user).create(0, user.address, btc.address, e18, user.address);
+        await dual.connect(user).create(0, user.address, btc.address, e18);
 
         await aggregatorBTC.updateAnswer(21000 * 1e8);
         await time.increase(12 * 60 * 60);
 
-        await expect(dual.connect(inviterAddress).replay(0, 0, 2, 1)).revertedWith("Dual: Access denied");
+        await expect(dual.connect(anotherAddress).replay(0, 0, 2, 1)).revertedWith("Dual: Access denied");
       });
     });
 
     describe("create by user, claim by admin", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -257,10 +233,10 @@ describe("dual", () => {
       });
 
       it("create by user", async () => {
-        await dual.connect(user).create(0, user.address, btc.address, e18, user.address);
+        await dual.connect(user).create(0, user.address, btc.address, e18);
 
         const userDual = await dual.get(0);
-        expect(userDual.user, user.address);
+        expect(userDual.user);
       });
 
       it("claim by admin", async () => {
@@ -283,13 +259,18 @@ describe("dual", () => {
 
     describe("create by user, replay by admin", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
+
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -302,10 +283,10 @@ describe("dual", () => {
       });
 
       it("create by user", async () => {
-        await dual.connect(user).create(0, user.address, btc.address, e18, user.address);
+        await dual.connect(user).create(0, user.address, btc.address, e18);
 
         const userDual = await dual.get(0);
-        expect(userDual.user, user.address);
+        expect(userDual.user);
       });
 
       it("replay by admin", async () => {
@@ -331,13 +312,18 @@ describe("dual", () => {
 
     describe("create by admin, claim by user", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
+
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -350,12 +336,12 @@ describe("dual", () => {
 
       it("create by admin", async () => {
         const userBalanceBefore = await btc.balanceOf(user.address);
-        await dual.create(0, user.address, btc.address, e18, user.address);
+        await dual.create(0, user.address, btc.address, e18);
 
         const userBalanceAfter = await btc.balanceOf(user.address);
 
         const userDual = await dual.get(0);
-        expect(userDual.user, user.address);
+        expect(userDual.user);
         expect(userBalanceBefore).eq(e18);
         expect(userBalanceAfter).eq(0);
       });
@@ -380,13 +366,18 @@ describe("dual", () => {
 
     describe("create by admin, replay by user", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
+
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -400,12 +391,12 @@ describe("dual", () => {
       it("create by admin", async () => {
         const userBalanceBefore = await btc.balanceOf(user.address);
 
-        await dual.create(0, user.address, btc.address, e18, user.address);
+        await dual.create(0, user.address, btc.address, e18);
 
         const userBalanceAfter = await btc.balanceOf(user.address);
 
         const userDual = await dual.get(0);
-        expect(userDual.user, user.address);
+        expect(userDual.user);
         expect(userBalanceBefore).eq(e18);
         expect(userBalanceAfter).eq(0);
       });
@@ -433,13 +424,18 @@ describe("dual", () => {
 
     describe("create by admin, claim by admin", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
+
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -453,12 +449,12 @@ describe("dual", () => {
       it("create by admin", async () => {
         const userBalanceBefore = await btc.balanceOf(user.address);
 
-        await dual.create(0, user.address, btc.address, e18, user.address);
+        await dual.create(0, user.address, btc.address, e18);
 
         const userBalanceAfter = await btc.balanceOf(user.address);
 
         const userDual = await dual.get(0);
-        expect(userDual.user, user.address);
+        expect(userDual.user);
         expect(userBalanceBefore).eq(e18);
         expect(userBalanceAfter).eq(0);
       });
@@ -483,13 +479,18 @@ describe("dual", () => {
 
     describe("create by admin, replay by admin", () => {
       before(async () => {
-        ({dual, vault, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
         await vault.updateThreshold(btc.address, e18);
 
         await dual.addTariff({
           baseToken: btc.address,
           quoteToken: usdt.address,
+          minBaseAmount: e18.div(100),
+          maxBaseAmount: e18.mul(5),
+          minQuoteAmount: 100 * 1e6,
+          maxQuoteAmount: 50000 * 1e6,
+
           stakingPeriod: 12,
           yield: 0.005 * 1e8,
           enabled: true,
@@ -503,12 +504,12 @@ describe("dual", () => {
       it("create by admin", async () => {
         const userBalanceBefore = await btc.balanceOf(user.address);
 
-        await dual.create(0, user.address, btc.address, e18, user.address);
+        await dual.create(0, user.address, btc.address, e18);
 
         const userBalanceAfter = await btc.balanceOf(user.address);
 
         const userDual = await dual.get(0);
-        expect(userDual.user, user.address);
+        expect(userDual.user);
         expect(userBalanceBefore).eq(e18);
         expect(userBalanceAfter).eq(0);
       });
@@ -538,664 +539,249 @@ describe("dual", () => {
   describe("input = base w/ up direction", () => {
     describe("create", () => {
       describe("claimed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let inviterAddress1: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, inviterAddress1, aggregatorBTC} =
-              await loadFixture(deploy));
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let anotherAddress: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
 
-            await vault.updateThreshold(btc.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("inviter can't be overriden", async () => {
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
-            const inviter1Before = await referral.inviters(inviterAddress1.address);
-            const originInviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress1.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
-            const inviter1After = await referral.inviters(inviterAddress1.address);
-            const originInviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(e18);
-            expect(vaultBalanceAfter).eq(e18.mul(2));
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(inviterAddress.address);
-            expect(inviterAddressAfter).eq(inviterAddress.address);
-
-            expect(inviter1Before.unclaimedBalance).eq(0);
-            expect(inviter1Before.claimedBalance).eq(0);
-            expect(inviter1Before.revShareFee).eq(0);
-            expect(inviter1Before.level).eq(0);
-
-            expect(inviter1After.unclaimedBalance).eq(0);
-            expect(inviter1After.claimedBalance).eq(0);
-            expect(inviter1After.revShareFee).eq(0);
-            expect(inviter1After.level).eq(0);
-
-            expect(originInviterBefore.unclaimedBalance).eq(10 * 1e6);
-            expect(originInviterBefore.claimedBalance).eq(0);
-            expect(originInviterBefore.revShareFee).eq(0);
-            expect(originInviterBefore.level).eq(0);
-
-            expect(originInviterAfter.unclaimedBalance).eq(20 * 1e6);
-            expect(originInviterAfter.claimedBalance).eq(0);
-            expect(originInviterAfter.revShareFee).eq(0);
-            expect(originInviterAfter.level).eq(0);
-          });
-
-          it("claim is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
-
-          it("claim", async () => {
-            await aggregatorBTC.updateAnswer(21000 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await usdt.transfer(vault.address, 20100 * 1e6);
-
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-
-            await dual.connect(user).claim(0, 2, 1);
-
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(20100 * 1e6);
-
-            expect(vaultBalanceBefore).eq(20100 * 1e6);
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(21000 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(20100 * 1e6);
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
-
-          it("should not be replayed after claimed", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(btc.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
-
-            await vault.updateThreshold(btc.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          await btc.transfer(user.address, e18);
+          await btc.connect(user).approve(vault.address, e18);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
+          await dual.create(0, user.address, btc.address, e18);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            await dual.create(0, user.address, btc.address, e18, ZERO_ADDRESS);
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceBefore).eq(e18);
+          expect(userBalanceAfter).eq(0);
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(btc.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("claim is not ready", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
+        });
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+        it("claim", async () => {
+          await aggregatorBTC.updateAnswer(21000 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await usdt.transfer(vault.address, 20100 * 1e6);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          const userBalanceBefore = await usdt.balanceOf(user.address);
+          const vaultBalanceBefore = await usdt.balanceOf(vault.address);
 
-          it("claim is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
+          await dual.connect(user).claim(0, 2, 1);
 
-          it("inviter can't be overriden", async () => {
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
+          const userBalanceAfter = await usdt.balanceOf(user.address);
+          const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+          const closedDual = await dual.get(0);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
+          expect(userBalanceBefore).eq(0);
+          expect(userBalanceAfter).eq(20100 * 1e6);
 
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress.address);
+          expect(vaultBalanceBefore).eq(20100 * 1e6);
+          expect(vaultBalanceAfter).eq(0);
 
-            const openedDual = await dual.get(0);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(btc.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(21000 * 1e6);
+          expect(closedDual.outputToken).eq(usdt.address);
+          expect(closedDual.outputAmount).eq(20100 * 1e6);
+        });
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
+        it("should not be double claimed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
 
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(e18);
-            expect(vaultBalanceAfter).eq(e18.mul(2));
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(referral.address);
-            expect(inviterAddressAfter).eq(referral.address);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(0);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("claim", async () => {
-            await aggregatorBTC.updateAnswer(21000 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await usdt.transfer(vault.address, 20100 * 1e6);
-
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-
-            await dual.connect(user).claim(0, 2, 1);
-
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(20100 * 1e6);
-
-            expect(vaultBalanceBefore).eq(20100 * 1e6);
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(21000 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(20100 * 1e6);
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
-
-          it("should not be replayed after claimed", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+        it("should not be replayed after claimed", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
         });
       });
 
       describe("replayed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
 
-            await vault.updateThreshold(btc.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, btc, usdt, user, aggregatorBTC} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("replay is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
-
-          it("replay", async () => {
-            await aggregatorBTC.updateAnswer(21000 * 1e8);
-            await time.increase(12 * 60 * 60);
-
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).replay(0, 0, 2, 1);
-
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(21000 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(20100 * 1e6);
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(btc.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(usdt.address);
-            expect(replayedDual.inputAmount).eq(20100 * 1e6);
-            expect(replayedDual.inputBaseAmount).eq(0);
-            expect(replayedDual.inputQuoteAmount).eq(20100 * 1e6);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(21000 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(20.05 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("should not be double replayed", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
-
-          it("should not be claimed after replayed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(btc.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, aggregatorBTC} = await loadFixture(deploy));
-
-            await vault.updateThreshold(btc.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          await btc.transfer(user.address, e18);
+          await btc.connect(user).approve(vault.address, e18);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
+          await dual.create(0, user.address, btc.address, e18);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            await dual.create(0, user.address, btc.address, e18, ZERO_ADDRESS);
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceBefore).eq(e18);
+          expect(userBalanceAfter).eq(0);
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(btc.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("replay is not ready", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Not finished yet");
+        });
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+        it("replay", async () => {
+          await aggregatorBTC.updateAnswer(21000 * 1e8);
+          await time.increase(12 * 60 * 60);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          await dual.connect(user).replay(0, 0, 2, 1);
 
-          it("replay is not ready", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Not finished yet");
-          });
+          const closedDual = await dual.get(0);
+          const replayedDual = await dual.get(1);
 
-          it("replay", async () => {
-            await aggregatorBTC.updateAnswer(21000 * 1e8);
-            await time.increase(12 * 60 * 60);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(btc.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(21000 * 1e6);
+          expect(closedDual.outputToken).eq(usdt.address);
+          expect(closedDual.outputAmount).eq(20100 * 1e6);
 
-            const inviterAddressBefore = await referral.users(user.address);
+          expect(replayedDual.id).eq(1);
+          expect(replayedDual.user).eq(user.address);
+          expect(replayedDual.tariffId).eq(0);
+          expect(replayedDual.baseToken).eq(btc.address);
+          expect(replayedDual.quoteToken).eq(usdt.address);
+          expect(replayedDual.inputToken).eq(usdt.address);
+          expect(replayedDual.inputAmount).eq(20100 * 1e6);
+          expect(replayedDual.inputBaseAmount).eq(0);
+          expect(replayedDual.inputQuoteAmount).eq(20100 * 1e6);
+          expect(replayedDual.stakingPeriod).eq(12);
+          expect(replayedDual.yield).eq(0.005 * 1e8);
+          expect(replayedDual.initialPrice).eq(21000 * 1e6);
+          expect(replayedDual.claimed).eq(false);
+          expect(replayedDual.closedPrice).eq(0);
+          expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(replayedDual.outputAmount).eq(0);
+        });
 
-            await dual.connect(user).replay(0, 0, 2, 1);
+        it("should not be double replayed", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
 
-            const inviterAddressAfter = await referral.users(user.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(21000 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(20100 * 1e6);
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(btc.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(usdt.address);
-            expect(replayedDual.inputAmount).eq(20100 * 1e6);
-            expect(replayedDual.inputBaseAmount).eq(0);
-            expect(replayedDual.inputQuoteAmount).eq(20100 * 1e6);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(21000 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(referral.address);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
-
-          it("should not be double replayed", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
-
-          it("should not be claimed after replayed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+        it("should not be claimed after replayed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
         });
 
         describe("different tariff", () => {
           let dual: DualFactory;
           let vault: Vault;
-          let referral: Referral;
+
           let btc: Token;
           let usdt: Token;
           let weth: WETH;
@@ -1203,7 +789,7 @@ describe("dual", () => {
           let aggregatorBTC: MockV3Aggregator;
 
           before(async () => {
-            ({dual, vault, referral, btc, weth, usdt, user, aggregatorBTC} = await loadFixture(deploy));
+            ({dual, vault, btc, weth, usdt, user, aggregatorBTC} = await loadFixture(deploy));
 
             await vault.updateThreshold(btc.address, e18);
           });
@@ -1212,28 +798,28 @@ describe("dual", () => {
             await dual.addTariff({
               baseToken: btc.address,
               quoteToken: usdt.address,
+              minBaseAmount: e18.div(100),
+              maxBaseAmount: e18.mul(5),
+              minQuoteAmount: 100 * 1e6,
+              maxQuoteAmount: 50000 * 1e6,
               stakingPeriod: 12,
               yield: 0.005 * 1e8,
               enabled: true,
               id: 0,
             });
 
-            await referral.updateRevShareFee(0.1 * 1e8);
-
             await btc.transfer(user.address, e18);
             await btc.connect(user).approve(vault.address, e18);
 
             const userBalanceBefore = await btc.balanceOf(user.address);
             const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
 
-            await dual.create(0, user.address, btc.address, e18, ZERO_ADDRESS);
+            await dual.create(0, user.address, btc.address, e18);
 
             const openedDual = await dual.get(0);
 
             const userBalanceAfter = await btc.balanceOf(user.address);
             const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
 
             expect(userBalanceBefore).eq(e18);
             expect(userBalanceAfter).eq(0);
@@ -1257,9 +843,6 @@ describe("dual", () => {
             expect(openedDual.closedPrice).eq(0);
             expect(openedDual.outputToken).eq(ZERO_ADDRESS);
             expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
           });
 
           it("replay is not ready", async () => {
@@ -1273,6 +856,10 @@ describe("dual", () => {
             await dual.addTariff({
               baseToken: weth.address,
               quoteToken: btc.address,
+              minBaseAmount: e18.div(10),
+              maxBaseAmount: e18.mul(50),
+              minQuoteAmount: e18.div(100),
+              maxQuoteAmount: e18.mul(5),
               stakingPeriod: 24,
               yield: 0.007 * 1e8,
               enabled: true,
@@ -1286,17 +873,18 @@ describe("dual", () => {
             await dual.addTariff({
               baseToken: btc.address,
               quoteToken: usdt.address,
+              minBaseAmount: e18.div(100),
+              maxBaseAmount: e18.mul(5),
+              minQuoteAmount: 100 * 1e6,
+              maxQuoteAmount: 50000 * 1e6,
               stakingPeriod: 24,
               yield: 0.007 * 1e8,
               enabled: true,
               id: 0,
             });
 
-            const inviterAddressBefore = await referral.users(user.address);
-
             await dual.connect(user).replay(0, 2, 2, 1);
 
-            const inviterAddressAfter = await referral.users(user.address);
             const closedDual = await dual.get(0);
             const replayedDual = await dual.get(1);
 
@@ -1333,9 +921,6 @@ describe("dual", () => {
             expect(replayedDual.closedPrice).eq(0);
             expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
             expect(replayedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(referral.address);
-            expect(inviterAddressAfter).eq(referral.address);
           });
 
           it("should not be double replayed", async () => {
@@ -1351,486 +936,222 @@ describe("dual", () => {
 
     describe("native", () => {
       describe("claimed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, inviterAddress, aggregatorWETH} = await loadFixture(deploy));
+        let weth: WETH;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorWETH: MockV3Aggregator;
 
-            await vault.updateThreshold(weth.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, weth, usdt, user, aggregatorWETH} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            const tx = await dual.connect(user).createETH(0, inviterAddress.address, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(0.65 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("claim", async () => {
-            await aggregatorWETH.updateAnswer(1400 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await usdt.transfer(vault.address, 1306.5 * 1e6);
-
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-
-            await dual.connect(user).claim(0, 2, 1);
-
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(1306.5 * 1e6);
-
-            expect(vaultBalanceBefore).eq(1306.5 * 1e6);
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1400 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(1306.5 * 1e6);
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(weth.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, aggregatorWETH} = await loadFixture(deploy));
-
-            await vault.updateThreshold(weth.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: weth.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(10),
+            maxBaseAmount: e18.mul(50),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const tx = await dual.connect(user).createETH(0, {value: e18});
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
 
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            const tx = await dual.connect(user).createETH(0, user.address, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
 
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(weth.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(weth.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(1300 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("claim", async () => {
+          await aggregatorWETH.updateAnswer(1400 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await usdt.transfer(vault.address, 1306.5 * 1e6);
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+          const userBalanceBefore = await usdt.balanceOf(user.address);
+          const vaultBalanceBefore = await usdt.balanceOf(vault.address);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          await dual.connect(user).claim(0, 2, 1);
 
-          it("claim", async () => {
-            await aggregatorWETH.updateAnswer(1400 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await usdt.transfer(vault.address, 1306.5 * 1e6);
+          const userBalanceAfter = await usdt.balanceOf(user.address);
+          const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+          const closedDual = await dual.get(0);
 
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
+          expect(userBalanceBefore).eq(0);
+          expect(userBalanceAfter).eq(1306.5 * 1e6);
 
-            await dual.connect(user).claim(0, 2, 1);
+          expect(vaultBalanceBefore).eq(1306.5 * 1e6);
+          expect(vaultBalanceAfter).eq(0);
 
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(weth.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(weth.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(1300 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(1400 * 1e6);
+          expect(closedDual.outputToken).eq(usdt.address);
+          expect(closedDual.outputAmount).eq(1306.5 * 1e6);
+        });
 
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(1306.5 * 1e6);
-
-            expect(vaultBalanceBefore).eq(1306.5 * 1e6);
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1400 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(1306.5 * 1e6);
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).revertedWith("Dual: Already claimed");
-          });
+        it("should not be double claimed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).revertedWith("Dual: Already claimed");
         });
       });
 
       describe("replayed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, inviterAddress, aggregatorWETH} = await loadFixture(deploy));
+        let weth: WETH;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorWETH: MockV3Aggregator;
 
-            await vault.updateThreshold(weth.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, weth, usdt, user, aggregatorWETH} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            const tx = await dual.connect(user).createETH(0, inviterAddress.address, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(0.65 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("replay", async () => {
-            await aggregatorWETH.updateAnswer(1400 * 1e8);
-            await time.increase(12 * 60 * 60);
-
-            const inviterAddressBefore = await referral.users(user.address);
-
-            await dual.connect(user).replay(0, 0, 2, 1);
-
-            const inviterAddressAfter = await referral.users(user.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1400 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(1306.5 * 1e6);
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(weth.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(usdt.address);
-            expect(replayedDual.inputAmount).eq(1306.5 * 1e6);
-            expect(replayedDual.inputBaseAmount).eq(0);
-            expect(replayedDual.inputQuoteAmount).eq(1306.5 * 1e6);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(1400 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(inviterAddress.address);
-            expect(inviterAddressAfter).eq(inviterAddress.address);
-          });
-
-          it("should not be double replayed", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(weth.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, aggregatorWETH} = await loadFixture(deploy));
-
-            await vault.updateThreshold(weth.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: weth.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(10),
+            maxBaseAmount: e18.mul(50),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const tx = await dual.connect(user).createETH(0, {value: e18});
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
 
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            const tx = await dual.connect(user).createETH(0, ZERO_ADDRESS, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
 
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(weth.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(weth.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(1300 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("replay", async () => {
+          await aggregatorWETH.updateAnswer(1400 * 1e8);
+          await time.increase(12 * 60 * 60);
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+          await dual.connect(user).replay(0, 0, 2, 1);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          const closedDual = await dual.get(0);
+          const replayedDual = await dual.get(1);
 
-          it("replay", async () => {
-            await aggregatorWETH.updateAnswer(1400 * 1e8);
-            await time.increase(12 * 60 * 60);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(weth.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(weth.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(1300 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(1400 * 1e6);
+          expect(closedDual.outputToken).eq(usdt.address);
+          expect(closedDual.outputAmount).eq(1306.5 * 1e6);
 
-            const inviterAddressBefore = await referral.users(user.address);
+          expect(replayedDual.id).eq(1);
+          expect(replayedDual.user).eq(user.address);
+          expect(replayedDual.tariffId).eq(0);
+          expect(replayedDual.baseToken).eq(weth.address);
+          expect(replayedDual.quoteToken).eq(usdt.address);
+          expect(replayedDual.inputToken).eq(usdt.address);
+          expect(replayedDual.inputAmount).eq(1306.5 * 1e6);
+          expect(replayedDual.inputBaseAmount).eq(0);
+          expect(replayedDual.inputQuoteAmount).eq(1306.5 * 1e6);
+          expect(replayedDual.stakingPeriod).eq(12);
+          expect(replayedDual.yield).eq(0.005 * 1e8);
+          expect(replayedDual.initialPrice).eq(1400 * 1e6);
+          expect(replayedDual.claimed).eq(false);
+          expect(replayedDual.closedPrice).eq(0);
+          expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(replayedDual.outputAmount).eq(0);
+        });
 
-            await dual.connect(user).replay(0, 0, 2, 1);
-
-            const inviterAddressAfter = await referral.users(user.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1400 * 1e6);
-            expect(closedDual.outputToken).eq(usdt.address);
-            expect(closedDual.outputAmount).eq(1306.5 * 1e6);
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(weth.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(usdt.address);
-            expect(replayedDual.inputAmount).eq(1306.5 * 1e6);
-            expect(replayedDual.inputBaseAmount).eq(0);
-            expect(replayedDual.inputQuoteAmount).eq(1306.5 * 1e6);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(1400 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(referral.address);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
-
-          it("should not be double replayed", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Already claimed");
-          });
+        it("should not be double replayed", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Already claimed");
         });
       });
     });
@@ -1839,1134 +1160,779 @@ describe("dual", () => {
   describe("input = base w/ down direction", () => {
     describe("token", () => {
       describe("claimed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let anotherAddress: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
 
-            await vault.updateThreshold(btc.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("claim is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
-
-          it("claim", async () => {
-            await aggregatorBTC.updateAnswer(19000 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await btc.transfer(vault.address, e18.mul(5).div(1000));
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-
-            await dual.connect(user).claim(0, 2, 1);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(e18.mul(1005).div(1000));
-
-            expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(19000 * 1e6);
-            expect(closedDual.outputToken).eq(btc.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(btc.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
-
-            await vault.updateThreshold(btc.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          await btc.transfer(user.address, e18);
+          await btc.connect(user).approve(vault.address, e18);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
+          await dual.create(0, user.address, btc.address, e18);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            await dual.create(0, user.address, btc.address, e18, ZERO_ADDRESS);
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceBefore).eq(e18);
+          expect(userBalanceAfter).eq(0);
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(btc.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("claim is not ready", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
+        });
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+        it("claim", async () => {
+          await aggregatorBTC.updateAnswer(19000 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await btc.transfer(vault.address, e18.mul(5).div(1000));
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-          it("claim is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
+          await dual.connect(user).claim(0, 2, 1);
 
-          it("inviter can't be overriden", async () => {
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
+          const closedDual = await dual.get(0);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
+          expect(userBalanceBefore).eq(0);
+          expect(userBalanceAfter).eq(e18.mul(1005).div(1000));
 
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress.address);
+          expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
+          expect(vaultBalanceAfter).eq(0);
 
-            const openedDual = await dual.get(0);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(btc.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(19000 * 1e6);
+          expect(closedDual.outputToken).eq(btc.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
+        });
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(e18);
-            expect(vaultBalanceAfter).eq(e18.mul(2));
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(referral.address);
-            expect(inviterAddressAfter).eq(referral.address);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(0);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("claim", async () => {
-            await aggregatorBTC.updateAnswer(19000 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await btc.transfer(vault.address, e18.mul(5).div(1000));
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-
-            await dual.connect(user).claim(0, 2, 1);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(e18.mul(1005).div(1000));
-
-            expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000).add(e18));
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(19000 * 1e6);
-            expect(closedDual.outputToken).eq(btc.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+        it("should not be double claimed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
         });
       });
+
       describe("replayed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
 
-            await vault.updateThreshold(btc.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, btc, usdt, user, aggregatorBTC} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, btc.address, e18, inviterAddress.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("replay is not ready", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
-
-          it("replay", async () => {
-            await aggregatorBTC.updateAnswer(19000 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await btc.transfer(vault.address, e18.mul(5).div(1000));
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-
-            await dual.connect(user).replay(0, 0, 2, 1);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(vaultBalanceAfter);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(19000 * 1e6);
-            expect(closedDual.outputToken).eq(btc.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(btc.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(btc.address);
-            expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputBaseAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputQuoteAmount).eq(0);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(19000 * 1e6);
-
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(btc.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, aggregatorBTC} = await loadFixture(deploy));
-
-            await vault.updateThreshold(btc.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          await btc.transfer(user.address, e18);
+          await btc.connect(user).approve(vault.address, e18);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-            await btc.transfer(user.address, e18);
-            await btc.connect(user).approve(vault.address, e18);
+          await dual.create(0, user.address, btc.address, e18);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            await dual.create(0, user.address, btc.address, e18, ZERO_ADDRESS);
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceBefore).eq(e18);
+          expect(userBalanceAfter).eq(0);
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceBefore).eq(e18);
-            expect(userBalanceAfter).eq(0);
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(btc.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("replay is not ready", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
+        });
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(btc.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+        it("replay", async () => {
+          await aggregatorBTC.updateAnswer(19000 * 1e8);
+          await time.increase(12 * 60 * 60);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-          it("replay is not ready", async () => {
-            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
+          await dual.connect(user).replay(0, 0, 2, 1);
 
-          it("replay", async () => {
-            await aggregatorBTC.updateAnswer(19000 * 1e8);
-            await time.increase(12 * 60 * 60);
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
+          const closedDual = await dual.get(0);
+          const replayedDual = await dual.get(1);
 
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
+          expect(userBalanceBefore).eq(0);
+          expect(userBalanceAfter).eq(0);
 
-            await dual.connect(user).replay(0, 0, 2, 1);
+          expect(vaultBalanceBefore).eq(e18);
+          expect(vaultBalanceAfter).eq(e18);
 
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(btc.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(19000 * 1e6);
+          expect(closedDual.outputToken).eq(btc.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
 
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(0);
+          expect(replayedDual.id).eq(1);
+          expect(replayedDual.user).eq(user.address);
+          expect(replayedDual.tariffId).eq(0);
+          expect(replayedDual.baseToken).eq(btc.address);
+          expect(replayedDual.quoteToken).eq(usdt.address);
+          expect(replayedDual.inputToken).eq(btc.address);
+          expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1000));
+          expect(replayedDual.inputBaseAmount).eq(e18.mul(1005).div(1000));
+          expect(replayedDual.inputQuoteAmount).eq(0);
+          expect(replayedDual.stakingPeriod).eq(12);
+          expect(replayedDual.yield).eq(0.005 * 1e8);
+          expect(replayedDual.initialPrice).eq(19000 * 1e6);
+          expect(replayedDual.claimed).eq(false);
+          expect(replayedDual.closedPrice).eq(0);
+          expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(replayedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(e18);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(btc.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(19000 * 1e6);
-            expect(closedDual.outputToken).eq(btc.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(btc.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(btc.address);
-            expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputBaseAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputQuoteAmount).eq(0);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(19000 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+        it("should not be double claimed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
         });
       });
     });
 
     describe("native", () => {
       describe("claimed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let owner: SignerWithAddress;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, owner, inviterAddress, aggregatorWETH} = await loadFixture(
-              deploy,
-            ));
+        let weth: WETH;
+        let usdt: Token;
+        let owner: SignerWithAddress;
+        let user: SignerWithAddress;
+        let aggregatorWETH: MockV3Aggregator;
 
-            await vault.updateThreshold(weth.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, weth, usdt, user, owner, aggregatorWETH} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            const tx = await dual.connect(user).createETH(0, inviterAddress.address, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(0.65 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("claim", async () => {
-            await aggregatorWETH.updateAnswer(1200 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await owner.sendTransaction({to: vault.address, value: e18.mul(5).div(1000)});
-
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-
-            const tx = await dual.connect(user).claim(0, 2, 1);
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.add(e18.mul(1005).div(1000)).sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1200 * 1e6);
-            expect(closedDual.outputToken).eq(weth.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-          });
+          await vault.updateThreshold(weth.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let owner: SignerWithAddress;
-          let user: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, owner, aggregatorWETH} = await loadFixture(deploy));
-
-            await vault.updateThreshold(weth.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: weth.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(10),
+            maxBaseAmount: e18.mul(50),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const tx = await dual.connect(user).createETH(0, {value: e18});
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
 
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            const tx = await dual.connect(user).createETH(0, ZERO_ADDRESS, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
 
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(weth.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(weth.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(1300 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("claim", async () => {
+          await aggregatorWETH.updateAnswer(1200 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await owner.sendTransaction({to: vault.address, value: e18.mul(5).div(1000)});
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          const tx = await dual.connect(user).claim(0, 2, 1);
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
 
-          it("claim", async () => {
-            await aggregatorWETH.updateAnswer(1200 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await owner.sendTransaction({to: vault.address, value: e18.mul(5).div(1000)});
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
+          const closedDual = await dual.get(0);
 
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
+          expect(userBalanceAfter).eq(userBalanceBefore.add(e18.mul(1005).div(1000)).sub(gasUsed));
 
-            const tx = await dual.connect(user).claim(0, 2, 1);
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+          expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
+          expect(vaultBalanceAfter).eq(0);
 
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.add(e18.mul(1005).div(1000)).sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1200 * 1e6);
-            expect(closedDual.outputToken).eq(weth.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-          });
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(weth.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(weth.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(1300 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(1200 * 1e6);
+          expect(closedDual.outputToken).eq(weth.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
         });
       });
 
       describe("replayed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
 
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, inviterAddress, aggregatorWETH} = await loadFixture(deploy));
+        let weth: WETH;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorWETH: MockV3Aggregator;
 
-            await vault.updateThreshold(weth.address, e18);
-          });
+        before(async () => {
+          ({dual, vault, weth, usdt, user, aggregatorWETH} = await loadFixture(deploy));
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            const tx = await dual.connect(user).createETH(0, inviterAddress.address, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(0.65 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("replay", async () => {
-            await aggregatorWETH.updateAnswer(1200 * 1e8);
-            await time.increase(12 * 60 * 60);
-
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-
-            const tx = await dual.connect(user).replay(0, 0, 2, 1);
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
-
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
-
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(e18);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1200 * 1e6);
-            expect(closedDual.outputToken).eq(weth.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(weth.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(weth.address);
-            expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputBaseAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputQuoteAmount).eq(0);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(1200 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-          });
+          await vault.updateThreshold(weth.address, e18);
         });
 
-        describe("non-referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let weth: WETH;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let aggregatorWETH: MockV3Aggregator;
-
-          before(async () => {
-            ({dual, vault, referral, weth, usdt, user, aggregatorWETH} = await loadFixture(deploy));
-
-            await vault.updateThreshold(weth.address, e18);
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: weth.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(10),
+            maxBaseAmount: e18.mul(50),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
           });
 
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: weth.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+          const tx = await dual.connect(user).createETH(0, {value: e18});
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
 
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
+          const openedDual = await dual.get(0);
 
-            const tx = await dual.connect(user).createETH(0, ZERO_ADDRESS, {value: e18});
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
 
-            const openedDual = await dual.get(0);
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
 
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
 
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(weth.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(weth.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(e18);
+          expect(openedDual.inputQuoteAmount).eq(0);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(1300 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
 
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(e18);
+        it("replay", async () => {
+          await aggregatorWETH.updateAnswer(1200 * 1e8);
+          await time.increase(12 * 60 * 60);
 
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(weth.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(weth.address);
-            expect(openedDual.inputAmount).eq(e18);
-            expect(openedDual.inputBaseAmount).eq(e18);
-            expect(openedDual.inputQuoteAmount).eq(0);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(1300 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
-            expect(inviterAddressBefore).eq(ZERO_ADDRESS);
-            expect(inviterAddressAfter).eq(referral.address);
-          });
+          const tx = await dual.connect(user).replay(0, 0, 2, 1);
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
 
-          it("replay", async () => {
-            await aggregatorWETH.updateAnswer(1200 * 1e8);
-            await time.increase(12 * 60 * 60);
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
+          const closedDual = await dual.get(0);
+          const replayedDual = await dual.get(1);
 
-            const userBalanceBefore = await ethers.provider.getBalance(user.address);
-            const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(gasUsed));
 
-            const tx = await dual.connect(user).replay(0, 0, 2, 1);
-            const receipt = await tx.wait();
-            const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+          expect(vaultBalanceBefore).eq(e18);
+          expect(vaultBalanceAfter).eq(e18);
 
-            const userBalanceAfter = await ethers.provider.getBalance(user.address);
-            const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
-            const closedDual = await dual.get(0);
-            const replayedDual = await dual.get(1);
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(weth.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(weth.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(e18);
+          expect(closedDual.inputQuoteAmount).eq(0);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(1300 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(1200 * 1e6);
+          expect(closedDual.outputToken).eq(weth.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
 
-            expect(userBalanceAfter).eq(userBalanceBefore.sub(gasUsed));
-
-            expect(vaultBalanceBefore).eq(e18);
-            expect(vaultBalanceAfter).eq(e18);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(weth.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(weth.address);
-            expect(closedDual.inputAmount).eq(e18);
-            expect(closedDual.inputBaseAmount).eq(e18);
-            expect(closedDual.inputQuoteAmount).eq(0);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(1300 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(1200 * 1e6);
-            expect(closedDual.outputToken).eq(weth.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-
-            expect(replayedDual.id).eq(1);
-            expect(replayedDual.user).eq(user.address);
-            expect(replayedDual.tariffId).eq(0);
-            expect(replayedDual.baseToken).eq(weth.address);
-            expect(replayedDual.quoteToken).eq(usdt.address);
-            expect(replayedDual.inputToken).eq(weth.address);
-            expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputBaseAmount).eq(e18.mul(1005).div(1000));
-            expect(replayedDual.inputQuoteAmount).eq(0);
-            expect(replayedDual.stakingPeriod).eq(12);
-            expect(replayedDual.yield).eq(0.005 * 1e8);
-            expect(replayedDual.initialPrice).eq(1200 * 1e6);
-            expect(replayedDual.claimed).eq(false);
-            expect(replayedDual.closedPrice).eq(0);
-            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(replayedDual.outputAmount).eq(0);
-          });
+          expect(replayedDual.id).eq(1);
+          expect(replayedDual.user).eq(user.address);
+          expect(replayedDual.tariffId).eq(0);
+          expect(replayedDual.baseToken).eq(weth.address);
+          expect(replayedDual.quoteToken).eq(usdt.address);
+          expect(replayedDual.inputToken).eq(weth.address);
+          expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1000));
+          expect(replayedDual.inputBaseAmount).eq(e18.mul(1005).div(1000));
+          expect(replayedDual.inputQuoteAmount).eq(0);
+          expect(replayedDual.stakingPeriod).eq(12);
+          expect(replayedDual.yield).eq(0.005 * 1e8);
+          expect(replayedDual.initialPrice).eq(1200 * 1e6);
+          expect(replayedDual.claimed).eq(false);
+          expect(replayedDual.closedPrice).eq(0);
+          expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(replayedDual.outputAmount).eq(0);
         });
       });
     });
   });
 
   describe("input = quote w/ up direction", () => {
-    describe("token", () => {
+    describe("create", () => {
       describe("claimed", () => {
-        describe("referral", () => {
+        let dual: DualFactory;
+        let vault: Vault;
+
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let anotherAddress: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
+
+        before(async () => {
+          ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
+
+          await vault.updateThreshold(usdt.address, e18);
+        });
+
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
+          });
+
+          await usdt.transfer(user.address, 20000 * 1e6);
+          await usdt.connect(user).approve(vault.address, 20000 * 1e6);
+
+          const userBalanceBefore = await usdt.balanceOf(user.address);
+          const vaultBalanceBefore = await usdt.balanceOf(vault.address);
+
+          await dual.create(0, user.address, usdt.address, 20000 * 1e6);
+
+          const openedDual = await dual.get(0);
+
+          const userBalanceAfter = await usdt.balanceOf(user.address);
+          const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+
+          expect(userBalanceBefore).eq(20000 * 1e6);
+          expect(userBalanceAfter).eq(0);
+
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(20000 * 1e6);
+
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(usdt.address);
+          expect(openedDual.inputAmount).eq(20000 * 1e6);
+          expect(openedDual.inputBaseAmount).eq(0);
+          expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
+
+        it("claim is not ready", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
+        });
+
+        it("claim", async () => {
+          await aggregatorBTC.updateAnswer(21000 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await usdt.transfer(vault.address, 100 * 1e6);
+
+          const userBalanceBefore = await usdt.balanceOf(user.address);
+          const vaultBalanceBefore = await usdt.balanceOf(vault.address);
+
+          await dual.connect(user).claim(0, 2, 1);
+
+          const userBalanceAfter = await usdt.balanceOf(user.address);
+          const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+          const closedDual = await dual.get(0);
+
+          expect(userBalanceBefore).eq(0);
+          expect(userBalanceAfter).eq(20100 * 1e6);
+
+          expect(vaultBalanceBefore).eq(20100 * 1e6);
+          expect(vaultBalanceAfter).eq(0);
+
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(usdt.address);
+          expect(closedDual.inputAmount).eq(20000 * 1e6);
+          expect(closedDual.inputBaseAmount).eq(0);
+          expect(closedDual.inputQuoteAmount).eq(20000 * 1e6);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(21000 * 1e6);
+          expect(closedDual.outputToken).eq(usdt.address);
+          expect(closedDual.outputAmount).eq(20100 * 1e6);
+        });
+
+        it("should not be double claimed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
+
+        it("should not be replayed after claimed", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
+      });
+
+      describe("replayed", () => {
+        let dual: DualFactory;
+        let vault: Vault;
+
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
+
+        before(async () => {
+          ({dual, vault, btc, usdt, user, aggregatorBTC} = await loadFixture(deploy));
+
+          await vault.updateThreshold(usdt.address, e18);
+        });
+
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
+          });
+
+          await usdt.transfer(user.address, 20000 * 1e6);
+          await usdt.connect(user).approve(vault.address, 20000 * 1e6);
+
+          const userBalanceBefore = await usdt.balanceOf(user.address);
+          const vaultBalanceBefore = await usdt.balanceOf(vault.address);
+
+          await dual.create(0, user.address, usdt.address, 20000 * 1e6);
+
+          const openedDual = await dual.get(0);
+
+          const userBalanceAfter = await usdt.balanceOf(user.address);
+          const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+
+          expect(userBalanceBefore).eq(20000 * 1e6);
+          expect(userBalanceAfter).eq(0);
+
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(20000 * 1e6);
+
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(usdt.address);
+          expect(openedDual.inputAmount).eq(20000 * 1e6);
+          expect(openedDual.inputBaseAmount).eq(0);
+          expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
+
+        it("replay is not ready", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Not finished yet");
+        });
+
+        it("replay", async () => {
+          await aggregatorBTC.updateAnswer(21000 * 1e8);
+          await time.increase(12 * 60 * 60);
+
+          await dual.connect(user).replay(0, 0, 2, 1);
+
+          const closedDual = await dual.get(0);
+          const replayedDual = await dual.get(1);
+
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(usdt.address);
+          expect(closedDual.inputAmount).eq(20000 * 1e6);
+          expect(closedDual.inputBaseAmount).eq(0);
+          expect(closedDual.inputQuoteAmount).eq(20000 * 1e6);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(21000 * 1e6);
+          expect(closedDual.outputToken).eq(usdt.address);
+          expect(closedDual.outputAmount).eq(20100 * 1e6);
+
+          expect(replayedDual.id).eq(1);
+          expect(replayedDual.user).eq(user.address);
+          expect(replayedDual.tariffId).eq(0);
+          expect(replayedDual.baseToken).eq(btc.address);
+          expect(replayedDual.quoteToken).eq(usdt.address);
+          expect(replayedDual.inputToken).eq(usdt.address);
+          expect(replayedDual.inputAmount).eq(20100 * 1e6);
+          expect(replayedDual.inputBaseAmount).eq(0);
+          expect(replayedDual.inputQuoteAmount).eq(20100 * 1e6);
+          expect(replayedDual.stakingPeriod).eq(12);
+          expect(replayedDual.yield).eq(0.005 * 1e8);
+          expect(replayedDual.initialPrice).eq(21000 * 1e6);
+          expect(replayedDual.claimed).eq(false);
+          expect(replayedDual.closedPrice).eq(0);
+          expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(replayedDual.outputAmount).eq(0);
+        });
+
+        it("should not be double replayed", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
+
+        it("should not be claimed after replayed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
+
+        describe("different tariff", () => {
           let dual: DualFactory;
           let vault: Vault;
-          let referral: Referral;
+
           let btc: Token;
           let usdt: Token;
+          let weth: WETH;
           let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let inviterAddress1: SignerWithAddress;
           let aggregatorBTC: MockV3Aggregator;
 
           before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, inviterAddress1, aggregatorBTC} =
-              await loadFixture(deploy));
+            ({dual, vault, btc, weth, usdt, user, aggregatorBTC} = await loadFixture(deploy));
 
-            await vault.updateThreshold(usdt.address, 20000 * 1e6);
+            await vault.updateThreshold(btc.address, e18);
           });
 
           it("create", async () => {
             await dual.addTariff({
               baseToken: btc.address,
               quoteToken: usdt.address,
+              minBaseAmount: e18.div(100),
+              maxBaseAmount: e18.mul(5),
+              minQuoteAmount: 100 * 1e6,
+              maxQuoteAmount: 50000 * 1e6,
               stakingPeriod: 12,
               yield: 0.005 * 1e8,
               enabled: true,
               id: 0,
             });
 
-            await referral.updateRevShareFee(0.1 * 1e8);
+            await btc.transfer(user.address, e18);
+            await btc.connect(user).approve(vault.address, e18);
 
-            await usdt.transfer(user.address, 20000 * 1e6);
-            await usdt.connect(user).approve(vault.address, 20000 * 1e6);
+            const userBalanceBefore = await btc.balanceOf(user.address);
+            const vaultBalanceBefore = await btc.balanceOf(vault.address);
 
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, usdt.address, 20000 * 1e6, inviterAddress.address);
+            await dual.create(0, user.address, btc.address, e18);
 
             const openedDual = await dual.get(0);
 
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
+            const userBalanceAfter = await btc.balanceOf(user.address);
+            const vaultBalanceAfter = await btc.balanceOf(vault.address);
 
-            expect(userBalanceBefore).eq(20000 * 1e6);
+            expect(userBalanceBefore).eq(e18);
             expect(userBalanceAfter).eq(0);
 
             expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(20000 * 1e6);
+            expect(vaultBalanceAfter).eq(e18);
 
             expect(openedDual.id).eq(0);
             expect(openedDual.user).eq(user.address);
             expect(openedDual.tariffId).eq(0);
             expect(openedDual.baseToken).eq(btc.address);
             expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(usdt.address);
-            expect(openedDual.inputAmount).eq(20000 * 1e6);
-            expect(openedDual.inputBaseAmount).eq(0);
-            expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
+            expect(openedDual.inputToken).eq(btc.address);
+            expect(openedDual.inputAmount).eq(e18);
+            expect(openedDual.inputBaseAmount).eq(e18);
+            expect(openedDual.inputQuoteAmount).eq(0);
             expect(openedDual.stakingPeriod).eq(12);
             expect(openedDual.yield).eq(0.005 * 1e8);
             expect(openedDual.initialPrice).eq(20000 * 1e6);
@@ -2974,118 +1940,60 @@ describe("dual", () => {
             expect(openedDual.closedPrice).eq(0);
             expect(openedDual.outputToken).eq(ZERO_ADDRESS);
             expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
           });
 
-          it("inviter can't be overriden", async () => {
-            await usdt.transfer(user.address, 20000 * 1e6);
-            await usdt.connect(user).approve(vault.address, 20000 * 1e6);
-
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
-            const inviter1Before = await referral.inviters(inviterAddress1.address);
-            const originInviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, usdt.address, 20000 * 1e6, inviterAddress1.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
-            const inviter1After = await referral.inviters(inviterAddress1.address);
-            const originInviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(20000 * 1e6);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(20000 * 1e6);
-            expect(vaultBalanceAfter).eq(40000 * 1e6);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(usdt.address);
-            expect(openedDual.inputAmount).eq(20000 * 1e6);
-            expect(openedDual.inputBaseAmount).eq(0);
-            expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(inviterAddress.address);
-            expect(inviterAddressAfter).eq(inviterAddress.address);
-
-            expect(inviter1Before.unclaimedBalance).eq(0);
-            expect(inviter1Before.claimedBalance).eq(0);
-            expect(inviter1Before.revShareFee).eq(0);
-            expect(inviter1Before.level).eq(0);
-
-            expect(inviter1After.unclaimedBalance).eq(0);
-            expect(inviter1After.claimedBalance).eq(0);
-            expect(inviter1After.revShareFee).eq(0);
-            expect(inviter1After.level).eq(0);
-
-            expect(originInviterBefore.unclaimedBalance).eq(10 * 1e6);
-            expect(originInviterBefore.claimedBalance).eq(0);
-            expect(originInviterBefore.revShareFee).eq(0);
-            expect(originInviterBefore.level).eq(0);
-
-            expect(originInviterAfter.unclaimedBalance).eq(20 * 1e6);
-            expect(originInviterAfter.claimedBalance).eq(0);
-            expect(originInviterAfter.revShareFee).eq(0);
-            expect(originInviterAfter.level).eq(0);
+          it("replay is not ready", async () => {
+            await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Not finished yet");
           });
 
-          it("claim is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
-
-          it("claim", async () => {
+          it("no replay with bad tariff", async () => {
             await aggregatorBTC.updateAnswer(21000 * 1e8);
             await time.increase(12 * 60 * 60);
-            await usdt.transfer(vault.address, 100 * 1e6);
 
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
+            await dual.addTariff({
+              baseToken: weth.address,
+              quoteToken: btc.address,
+              minBaseAmount: e18.div(10),
+              maxBaseAmount: e18.mul(50),
+              minQuoteAmount: e18.div(100),
+              maxQuoteAmount: e18.mul(5),
+              stakingPeriod: 24,
+              yield: 0.007 * 1e8,
+              enabled: true,
+              id: 0,
+            });
 
-            await dual.connect(user).claim(0, 2, 1);
+            await expect(dual.connect(user).replay(0, 1, 2, 1)).revertedWith("Dual: Input must be one from pair");
+          });
 
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+          it("replay", async () => {
+            await dual.addTariff({
+              baseToken: btc.address,
+              quoteToken: usdt.address,
+              minBaseAmount: e18.div(100),
+              maxBaseAmount: e18.mul(5),
+              minQuoteAmount: 100 * 1e6,
+              maxQuoteAmount: 50000 * 1e6,
+              stakingPeriod: 24,
+              yield: 0.007 * 1e8,
+              enabled: true,
+              id: 0,
+            });
+
+            await dual.connect(user).replay(0, 2, 2, 1);
+
             const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(20100 * 1e6);
-
-            expect(vaultBalanceBefore).eq(40100 * 1e6);
-            expect(vaultBalanceAfter).eq(20000 * 1e6);
+            const replayedDual = await dual.get(1);
 
             expect(closedDual.id).eq(0);
             expect(closedDual.user).eq(user.address);
             expect(closedDual.tariffId).eq(0);
             expect(closedDual.baseToken).eq(btc.address);
             expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(usdt.address);
-            expect(closedDual.inputAmount).eq(20000 * 1e6);
-            expect(closedDual.inputBaseAmount).eq(0);
-            expect(closedDual.inputQuoteAmount).eq(20000 * 1e6);
+            expect(closedDual.inputToken).eq(btc.address);
+            expect(closedDual.inputAmount).eq(e18);
+            expect(closedDual.inputBaseAmount).eq(e18);
+            expect(closedDual.inputQuoteAmount).eq(0);
             expect(closedDual.stakingPeriod).eq(12);
             expect(closedDual.yield).eq(0.005 * 1e8);
             expect(closedDual.initialPrice).eq(20000 * 1e6);
@@ -3093,27 +2001,260 @@ describe("dual", () => {
             expect(closedDual.closedPrice).eq(21000 * 1e6);
             expect(closedDual.outputToken).eq(usdt.address);
             expect(closedDual.outputAmount).eq(20100 * 1e6);
+
+            expect(replayedDual.id).eq(1);
+            expect(replayedDual.user).eq(user.address);
+            expect(replayedDual.tariffId).eq(2);
+            expect(replayedDual.baseToken).eq(btc.address);
+            expect(replayedDual.quoteToken).eq(usdt.address);
+            expect(replayedDual.inputToken).eq(usdt.address);
+            expect(replayedDual.inputAmount).eq(20100 * 1e6);
+            expect(replayedDual.inputBaseAmount).eq(0);
+            expect(replayedDual.inputQuoteAmount).eq(20100 * 1e6);
+            expect(replayedDual.stakingPeriod).eq(24);
+            expect(replayedDual.yield).eq(0.007 * 1e8);
+            expect(replayedDual.initialPrice).eq(21000 * 1e6);
+            expect(replayedDual.claimed).eq(false);
+            expect(replayedDual.closedPrice).eq(0);
+            expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+            expect(replayedDual.outputAmount).eq(0);
           });
 
-          it("should not be double claimed", async () => {
+          it("should not be double replayed", async () => {
+            await expect(dual.connect(user).replay(0, 0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+          });
+
+          it("should not be claimed after replayed", async () => {
             await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
           });
         });
-        describe("non-referral", () => {});
-      });
-      describe("replayed", () => {
-        describe("referral", () => {});
-        describe("non-referral", () => {});
       });
     });
+
     describe("native", () => {
       describe("claimed", () => {
-        describe("referral", () => {});
-        describe("non-referral", () => {});
+        let dual: DualFactory;
+        let vault: Vault;
+
+        let weth: WETH;
+        let usdt: Token;
+        let btc: Token;
+        let owner: SignerWithAddress;
+        let user: SignerWithAddress;
+        let aggregatorWETH: MockV3Aggregator;
+
+        before(async () => {
+          ({dual, vault, btc, weth, usdt, owner, user, aggregatorWETH} = await loadFixture(deploy));
+
+          await vault.updateThreshold(weth.address, e18);
+        });
+
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: weth.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: e18.div(10),
+            maxQuoteAmount: e18.mul(50),
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
+          });
+
+          await aggregatorWETH.updateAnswer(1250 * 1e8);
+
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
+
+          const tx = await dual.connect(user).createETH(0, {value: e18});
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+
+          const openedDual = await dual.get(0);
+
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
+
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
+
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
+
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(weth.address);
+          expect(openedDual.inputToken).eq(weth.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(0);
+          expect(openedDual.inputQuoteAmount).eq(e18);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(e18.mul(16));
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
+
+        it("claim", async () => {
+          await aggregatorWETH.updateAnswer(1000 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await owner.sendTransaction({to: vault.address, value: e18.mul(5).div(1000)});
+
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
+
+          const tx = await dual.connect(user).claim(0, 1, 3);
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
+          const closedDual = await dual.get(0);
+
+          expect(userBalanceAfter).eq(userBalanceBefore.add(e18.mul(1005).div(1000)).sub(gasUsed));
+
+          expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
+          expect(vaultBalanceAfter).eq(0);
+
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(weth.address);
+          expect(closedDual.inputToken).eq(weth.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(0);
+          expect(closedDual.inputQuoteAmount).eq(e18);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(e18.mul(16));
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(e18.mul(20));
+          expect(closedDual.outputToken).eq(weth.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1e3));
+        });
       });
+
       describe("replayed", () => {
-        describe("referral", () => {});
-        describe("non-referral", () => {});
+        let dual: DualFactory;
+        let vault: Vault;
+
+        let weth: WETH;
+        let usdt: Token;
+        let btc: Token;
+        let owner: SignerWithAddress;
+        let user: SignerWithAddress;
+        let aggregatorWETH: MockV3Aggregator;
+
+        before(async () => {
+          ({dual, vault, btc, weth, usdt, owner, user, aggregatorWETH} = await loadFixture(deploy));
+
+          await vault.updateThreshold(weth.address, e18);
+        });
+
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: weth.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: e18.div(10),
+            maxQuoteAmount: e18.mul(50),
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
+          });
+
+          await aggregatorWETH.updateAnswer(1250 * 1e8);
+
+          const userBalanceBefore = await ethers.provider.getBalance(user.address);
+          const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
+
+          const tx = await dual.connect(user).createETH(0, {value: e18});
+          const receipt = await tx.wait();
+          const gasUsed = receipt.gasUsed.mul(receipt.effectiveGasPrice);
+
+          const openedDual = await dual.get(0);
+
+          const userBalanceAfter = await ethers.provider.getBalance(user.address);
+          const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
+
+          expect(userBalanceAfter).eq(userBalanceBefore.sub(e18).sub(gasUsed));
+
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(e18);
+
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(weth.address);
+          expect(openedDual.inputToken).eq(weth.address);
+          expect(openedDual.inputAmount).eq(e18);
+          expect(openedDual.inputBaseAmount).eq(0);
+          expect(openedDual.inputQuoteAmount).eq(e18);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(e18.mul(16));
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
+
+        it("replay", async () => {
+          await aggregatorWETH.updateAnswer(1000 * 1e8);
+          await time.increase(12 * 60 * 60);
+
+          await dual.connect(user).replay(0, 0, 1, 3);
+
+          const closedDual = await dual.get(0);
+          const replayedDual = await dual.get(1);
+
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(weth.address);
+          expect(closedDual.inputToken).eq(weth.address);
+          expect(closedDual.inputAmount).eq(e18);
+          expect(closedDual.inputBaseAmount).eq(0);
+          expect(closedDual.inputQuoteAmount).eq(e18);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(e18.mul(16));
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(e18.mul(20));
+          expect(closedDual.outputToken).eq(weth.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1e3));
+
+          expect(replayedDual.id).eq(1);
+          expect(replayedDual.user).eq(user.address);
+          expect(replayedDual.tariffId).eq(0);
+          expect(replayedDual.baseToken).eq(btc.address);
+          expect(replayedDual.quoteToken).eq(weth.address);
+          expect(replayedDual.inputToken).eq(weth.address);
+          expect(replayedDual.inputAmount).eq(e18.mul(1005).div(1e3));
+          expect(replayedDual.inputBaseAmount).eq(0);
+          expect(replayedDual.inputQuoteAmount).eq(e18.mul(1005).div(1e3));
+          expect(replayedDual.stakingPeriod).eq(12);
+          expect(replayedDual.yield).eq(0.005 * 1e8);
+          expect(replayedDual.initialPrice).eq(e18.mul(20));
+          expect(replayedDual.claimed).eq(false);
+          expect(replayedDual.closedPrice).eq(0);
+          expect(replayedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(replayedDual.outputAmount).eq(0);
+        });
+
+        it("should not be double replayed", async () => {
+          await expect(dual.connect(user).replay(0, 0, 2, 1)).revertedWith("Dual: Already claimed");
+        });
       });
     });
   });
@@ -3121,213 +2262,115 @@ describe("dual", () => {
   describe("input = quote w/ down direction", () => {
     describe("token", () => {
       describe("claimed", () => {
-        describe("referral", () => {
-          let dual: DualFactory;
-          let vault: Vault;
-          let referral: Referral;
-          let btc: Token;
-          let usdt: Token;
-          let user: SignerWithAddress;
-          let inviterAddress: SignerWithAddress;
-          let inviterAddress1: SignerWithAddress;
-          let aggregatorBTC: MockV3Aggregator;
+        let dual: DualFactory;
+        let vault: Vault;
+        let btc: Token;
+        let usdt: Token;
+        let user: SignerWithAddress;
+        let aggregatorBTC: MockV3Aggregator;
 
-          before(async () => {
-            ({dual, vault, referral, btc, usdt, user, inviterAddress, inviterAddress1, aggregatorBTC} =
-              await loadFixture(deploy));
+        before(async () => {
+          ({dual, vault, btc, usdt, user, aggregatorBTC} = await loadFixture(deploy));
 
-            await vault.updateThreshold(usdt.address, 20000 * 1e6);
-          });
-
-          it("create", async () => {
-            await dual.addTariff({
-              baseToken: btc.address,
-              quoteToken: usdt.address,
-              stakingPeriod: 12,
-              yield: 0.005 * 1e8,
-              enabled: true,
-              id: 0,
-            });
-
-            await referral.updateRevShareFee(0.1 * 1e8);
-
-            await usdt.transfer(user.address, 20000 * 1e6);
-            await usdt.connect(user).approve(vault.address, 20000 * 1e6);
-
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-            const inviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, usdt.address, 20000 * 1e6, inviterAddress.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const inviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(20000 * 1e6);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(0);
-            expect(vaultBalanceAfter).eq(20000 * 1e6);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(usdt.address);
-            expect(openedDual.inputAmount).eq(20000 * 1e6);
-            expect(openedDual.inputBaseAmount).eq(0);
-            expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterBefore.unclaimedBalance).eq(0);
-            expect(inviterBefore.claimedBalance).eq(0);
-            expect(inviterBefore.revShareFee).eq(0);
-            expect(inviterBefore.level).eq(0);
-
-            expect(inviterAfter.unclaimedBalance).eq(10 * 1e6);
-            expect(inviterAfter.claimedBalance).eq(0);
-            expect(inviterAfter.revShareFee).eq(0);
-            expect(inviterAfter.level).eq(0);
-          });
-
-          it("inviter can't be overriden", async () => {
-            await usdt.transfer(user.address, 20000 * 1e6);
-            await usdt.connect(user).approve(vault.address, 20000 * 1e6);
-
-            const userBalanceBefore = await usdt.balanceOf(user.address);
-            const vaultBalanceBefore = await usdt.balanceOf(vault.address);
-            const inviterAddressBefore = await referral.users(user.address);
-            const inviter1Before = await referral.inviters(inviterAddress1.address);
-            const originInviterBefore = await referral.inviters(inviterAddress.address);
-
-            await dual.connect(user).create(0, user.address, usdt.address, 20000 * 1e6, inviterAddress1.address);
-
-            const openedDual = await dual.get(0);
-
-            const userBalanceAfter = await usdt.balanceOf(user.address);
-            const vaultBalanceAfter = await usdt.balanceOf(vault.address);
-            const inviterAddressAfter = await referral.users(user.address);
-            const inviter1After = await referral.inviters(inviterAddress1.address);
-            const originInviterAfter = await referral.inviters(inviterAddress.address);
-
-            expect(userBalanceBefore).eq(20000 * 1e6);
-            expect(userBalanceAfter).eq(0);
-
-            expect(vaultBalanceBefore).eq(20000 * 1e6);
-            expect(vaultBalanceAfter).eq(40000 * 1e6);
-
-            expect(openedDual.id).eq(0);
-            expect(openedDual.user).eq(user.address);
-            expect(openedDual.tariffId).eq(0);
-            expect(openedDual.baseToken).eq(btc.address);
-            expect(openedDual.quoteToken).eq(usdt.address);
-            expect(openedDual.inputToken).eq(usdt.address);
-            expect(openedDual.inputAmount).eq(20000 * 1e6);
-            expect(openedDual.inputBaseAmount).eq(0);
-            expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
-            expect(openedDual.stakingPeriod).eq(12);
-            expect(openedDual.yield).eq(0.005 * 1e8);
-            expect(openedDual.initialPrice).eq(20000 * 1e6);
-            expect(openedDual.claimed).eq(false);
-            expect(openedDual.closedPrice).eq(0);
-            expect(openedDual.outputToken).eq(ZERO_ADDRESS);
-            expect(openedDual.outputAmount).eq(0);
-
-            expect(inviterAddressBefore).eq(inviterAddress.address);
-            expect(inviterAddressAfter).eq(inviterAddress.address);
-
-            expect(inviter1Before.unclaimedBalance).eq(0);
-            expect(inviter1Before.claimedBalance).eq(0);
-            expect(inviter1Before.revShareFee).eq(0);
-            expect(inviter1Before.level).eq(0);
-
-            expect(inviter1After.unclaimedBalance).eq(0);
-            expect(inviter1After.claimedBalance).eq(0);
-            expect(inviter1After.revShareFee).eq(0);
-            expect(inviter1After.level).eq(0);
-
-            expect(originInviterBefore.unclaimedBalance).eq(10 * 1e6);
-            expect(originInviterBefore.claimedBalance).eq(0);
-            expect(originInviterBefore.revShareFee).eq(0);
-            expect(originInviterBefore.level).eq(0);
-
-            expect(originInviterAfter.unclaimedBalance).eq(20 * 1e6);
-            expect(originInviterAfter.claimedBalance).eq(0);
-            expect(originInviterAfter.revShareFee).eq(0);
-            expect(originInviterAfter.level).eq(0);
-          });
-
-          it("claim is not ready", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
-          });
-
-          it("claim", async () => {
-            await aggregatorBTC.updateAnswer(19000 * 1e8);
-            await time.increase(12 * 60 * 60);
-            await btc.transfer(vault.address, e18.mul(1005).div(1000));
-
-            const userBalanceBefore = await btc.balanceOf(user.address);
-            const vaultBalanceBefore = await btc.balanceOf(vault.address);
-
-            await dual.connect(user).claim(0, 2, 1);
-
-            const userBalanceAfter = await btc.balanceOf(user.address);
-            const vaultBalanceAfter = await btc.balanceOf(vault.address);
-            const closedDual = await dual.get(0);
-
-            expect(userBalanceBefore).eq(0);
-            expect(userBalanceAfter).eq(e18.mul(1005).div(1000));
-
-            expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
-            expect(vaultBalanceAfter).eq(0);
-
-            expect(closedDual.id).eq(0);
-            expect(closedDual.user).eq(user.address);
-            expect(closedDual.tariffId).eq(0);
-            expect(closedDual.baseToken).eq(btc.address);
-            expect(closedDual.quoteToken).eq(usdt.address);
-            expect(closedDual.inputToken).eq(usdt.address);
-            expect(closedDual.inputAmount).eq(20000 * 1e6);
-            expect(closedDual.inputBaseAmount).eq(0);
-            expect(closedDual.inputQuoteAmount).eq(20000 * 1e6);
-            expect(closedDual.stakingPeriod).eq(12);
-            expect(closedDual.yield).eq(0.005 * 1e8);
-            expect(closedDual.initialPrice).eq(20000 * 1e6);
-            expect(closedDual.claimed).eq(true);
-            expect(closedDual.closedPrice).eq(19000 * 1e6);
-            expect(closedDual.outputToken).eq(btc.address);
-            expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
-          });
-
-          it("should not be double claimed", async () => {
-            await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
-          });
+          await vault.updateThreshold(usdt.address, 20000 * 1e6);
         });
-        describe("non-referral", () => {});
-      });
-      describe("replayed", () => {
-        describe("referral", () => {});
-        describe("non-referral", () => {});
-      });
-    });
-    describe("native", () => {
-      describe("claimed", () => {
-        describe("referral", () => {});
-        describe("non-referral", () => {});
-      });
-      describe("replayed", () => {
-        describe("referral", () => {});
-        describe("non-referral", () => {});
+
+        it("create", async () => {
+          await dual.addTariff({
+            baseToken: btc.address,
+            quoteToken: usdt.address,
+            minBaseAmount: e18.div(100),
+            maxBaseAmount: e18.mul(5),
+            minQuoteAmount: 100 * 1e6,
+            maxQuoteAmount: 50000 * 1e6,
+            stakingPeriod: 12,
+            yield: 0.005 * 1e8,
+            enabled: true,
+            id: 0,
+          });
+
+          await usdt.transfer(user.address, 20000 * 1e6);
+          await usdt.connect(user).approve(vault.address, 20000 * 1e6);
+
+          const userBalanceBefore = await usdt.balanceOf(user.address);
+          const vaultBalanceBefore = await usdt.balanceOf(vault.address);
+
+          await dual.connect(user).create(0, user.address, usdt.address, 20000 * 1e6);
+
+          const openedDual = await dual.get(0);
+
+          const userBalanceAfter = await usdt.balanceOf(user.address);
+          const vaultBalanceAfter = await usdt.balanceOf(vault.address);
+
+          expect(userBalanceBefore).eq(20000 * 1e6);
+          expect(userBalanceAfter).eq(0);
+
+          expect(vaultBalanceBefore).eq(0);
+          expect(vaultBalanceAfter).eq(20000 * 1e6);
+
+          expect(openedDual.id).eq(0);
+          expect(openedDual.user).eq(user.address);
+          expect(openedDual.tariffId).eq(0);
+          expect(openedDual.baseToken).eq(btc.address);
+          expect(openedDual.quoteToken).eq(usdt.address);
+          expect(openedDual.inputToken).eq(usdt.address);
+          expect(openedDual.inputAmount).eq(20000 * 1e6);
+          expect(openedDual.inputBaseAmount).eq(0);
+          expect(openedDual.inputQuoteAmount).eq(20000 * 1e6);
+          expect(openedDual.stakingPeriod).eq(12);
+          expect(openedDual.yield).eq(0.005 * 1e8);
+          expect(openedDual.initialPrice).eq(20000 * 1e6);
+          expect(openedDual.claimed).eq(false);
+          expect(openedDual.closedPrice).eq(0);
+          expect(openedDual.outputToken).eq(ZERO_ADDRESS);
+          expect(openedDual.outputAmount).eq(0);
+        });
+
+        it("claim is not ready", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Not finished yet");
+        });
+
+        it("claim", async () => {
+          await aggregatorBTC.updateAnswer(19000 * 1e8);
+          await time.increase(12 * 60 * 60);
+          await btc.transfer(vault.address, e18.mul(1005).div(1000));
+
+          const userBalanceBefore = await btc.balanceOf(user.address);
+          const vaultBalanceBefore = await btc.balanceOf(vault.address);
+
+          await dual.connect(user).claim(0, 2, 1);
+
+          const userBalanceAfter = await btc.balanceOf(user.address);
+          const vaultBalanceAfter = await btc.balanceOf(vault.address);
+          const closedDual = await dual.get(0);
+
+          expect(userBalanceBefore).eq(0);
+          expect(userBalanceAfter).eq(e18.mul(1005).div(1000));
+
+          expect(vaultBalanceBefore).eq(e18.mul(1005).div(1000));
+          expect(vaultBalanceAfter).eq(0);
+
+          expect(closedDual.id).eq(0);
+          expect(closedDual.user).eq(user.address);
+          expect(closedDual.tariffId).eq(0);
+          expect(closedDual.baseToken).eq(btc.address);
+          expect(closedDual.quoteToken).eq(usdt.address);
+          expect(closedDual.inputToken).eq(usdt.address);
+          expect(closedDual.inputAmount).eq(20000 * 1e6);
+          expect(closedDual.inputBaseAmount).eq(0);
+          expect(closedDual.inputQuoteAmount).eq(20000 * 1e6);
+          expect(closedDual.stakingPeriod).eq(12);
+          expect(closedDual.yield).eq(0.005 * 1e8);
+          expect(closedDual.initialPrice).eq(20000 * 1e6);
+          expect(closedDual.claimed).eq(true);
+          expect(closedDual.closedPrice).eq(19000 * 1e6);
+          expect(closedDual.outputToken).eq(btc.address);
+          expect(closedDual.outputAmount).eq(e18.mul(1005).div(1000));
+        });
+
+        it("should not be double claimed", async () => {
+          await expect(dual.connect(user).claim(0, 2, 1)).to.be.revertedWith("Dual: Already claimed");
+        });
       });
     });
   });
@@ -3335,19 +2378,23 @@ describe("dual", () => {
   describe("list & count", () => {
     let dual: DualFactory;
     let vault: Vault;
-    let referral: Referral;
+
     let btc: Token;
     let usdt: Token;
     let user: SignerWithAddress;
-    let inviterAddress: SignerWithAddress;
+    let anotherAddress: SignerWithAddress;
     let aggregatorBTC: MockV3Aggregator;
 
     before(async () => {
-      ({dual, vault, referral, btc, usdt, user, inviterAddress, aggregatorBTC} = await loadFixture(deploy));
+      ({dual, vault, btc, usdt, user, anotherAddress, aggregatorBTC} = await loadFixture(deploy));
 
       await dual.addTariff({
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: true,
@@ -3357,47 +2404,49 @@ describe("dual", () => {
       await dual.addTariff({
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 24,
         yield: 0.005 * 1e8,
         enabled: true,
         id: 0,
       });
 
-      await referral.updateRevShareFee(0.1 * 1e8);
-
       await vault.updateThreshold(usdt.address, 100000 * 1e6);
       await usdt.transfer(user.address, 60000 * 1e6);
       await usdt.connect(user).approve(vault.address, 60000 * 1e6);
       await aggregatorBTC.updateAnswer(21000 * 10 ** 8);
 
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(0, user.address, usdt.address, 2000 * 1e6);
 
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
-      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6, inviterAddress.address);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
+      await dual.connect(user).create(1, user.address, usdt.address, 2000 * 1e6);
 
       await time.increase(12 * 60 * 60 + 1);
 
@@ -3510,6 +2559,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: true,
@@ -3519,6 +2572,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 24,
         yield: 0.01 * 1e8,
         enabled: true,
@@ -3554,6 +2611,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: true,
@@ -3578,6 +2639,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: false,
@@ -3607,6 +2672,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: false,
@@ -3635,6 +2704,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: true,
@@ -3644,6 +2717,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 24,
         yield: 0.01 * 1e8,
         enabled: true,
@@ -3687,6 +2764,10 @@ describe("dual", () => {
         id: 0,
         baseToken: btc.address,
         quoteToken: usdt.address,
+        minBaseAmount: e18.div(100),
+        maxBaseAmount: e18.mul(5),
+        minQuoteAmount: 100 * 1e6,
+        maxQuoteAmount: 50000 * 1e6,
         stakingPeriod: 12,
         yield: 0.005 * 1e8,
         enabled: true,
@@ -3776,68 +2857,6 @@ describe("dual", () => {
     });
   });
 
-  describe("updateLimits()", () => {
-    it("should update limits", async () => {
-      const {dual, btc, usdt, weth} = await loadFixture(deploy);
-
-      const limitsBefore = await dual.limits();
-
-      await dual.updateLimits(btc.address, {
-        minAmount: e18.div(10),
-        maxAmount: e18.mul(10),
-      });
-
-      const limitsAfter = await dual.limits();
-
-      expect(limitsBefore.length).to.be.equal(3);
-      expect(limitsAfter.length).to.be.equal(3);
-
-      expect(limitsBefore[0].token).to.be.equal(btc.address);
-      expect(limitsBefore[0].minAmount).to.be.equal(e18.div(100));
-      expect(limitsBefore[0].maxAmount).to.be.equal(e18.mul(5));
-
-      expect(limitsBefore[1].token).to.be.equal(usdt.address);
-      expect(limitsBefore[1].minAmount).to.be.equal(100 * 1e6);
-      expect(limitsBefore[1].maxAmount).to.be.equal(50_000 * 1e6);
-
-      expect(limitsBefore[2].token).to.be.equal(weth.address);
-      expect(limitsBefore[2].minAmount).to.be.equal(e18.div(10));
-      expect(limitsBefore[2].maxAmount).to.be.equal(e18.mul(50));
-
-      expect(limitsAfter[0].token).to.be.equal(btc.address);
-      expect(limitsAfter[0].minAmount).to.be.equal(e18.div(10));
-      expect(limitsAfter[0].maxAmount).to.be.equal(e18.mul(10));
-
-      expect(limitsAfter[1].token).to.be.equal(usdt.address);
-      expect(limitsAfter[1].minAmount).to.be.equal(100 * 1e6);
-      expect(limitsAfter[1].maxAmount).to.be.equal(50_000 * 1e6);
-
-      expect(limitsAfter[2].token).to.be.equal(weth.address);
-      expect(limitsAfter[2].minAmount).to.be.equal(e18.div(10));
-      expect(limitsAfter[2].maxAmount).to.be.equal(e18.mul(50));
-    });
-
-    it("should not update limits if has no access", async () => {
-      const {dual, user, btc} = await loadFixture(deploy);
-
-      const limitsBefore = await dual.limits();
-
-      const tx = dual.connect(user).updateLimits(btc.address, {
-        minAmount: e18.div(10),
-        maxAmount: e18.mul(10),
-      });
-
-      await expect(tx).to.be.revertedWith(
-        `AccessControl: account ${user.address.toLowerCase()} is missing role 0x0000000000000000000000000000000000000000000000000000000000000000`,
-      );
-
-      const limitsAfter = await dual.limits();
-
-      expect(limitsAfter).to.be.deep.equal(limitsBefore);
-      expect(limitsAfter.length).to.be.equal(3);
-    });
-  });
-
   describe("updateVault()", () => {
     it("should update vault", async () => {
       const {dual} = await loadFixture(deploy);
@@ -3901,39 +2920,6 @@ describe("dual", () => {
       const priceFeedAfter = await dual.priceFeed();
 
       expect(priceFeedAfter).to.be.equal(priceFeedBefore);
-    });
-  });
-
-  describe("updateReferral()", () => {
-    it("should update referral", async () => {
-      const {dual} = await loadFixture(deploy);
-      const {address} = ethers.Wallet.createRandom();
-
-      const referralBefore = await dual.referral();
-
-      await dual.updateReferral(address);
-
-      const referralAfter = await dual.referral();
-
-      expect(referralAfter).not.to.be.equal(referralBefore);
-      expect(referralAfter).to.be.equal(address);
-    });
-
-    it("should not update referral if has no access", async () => {
-      const {dual, user} = await loadFixture(deploy);
-      const {address} = ethers.Wallet.createRandom();
-
-      const referralBefore = await dual.referral();
-
-      const tx = dual.connect(user).updateReferral(address);
-
-      await expect(tx).to.be.revertedWith(
-        `AccessControl: account ${user.address.toLowerCase()} is missing role 0x0000000000000000000000000000000000000000000000000000000000000000`,
-      );
-
-      const referralAfter = await dual.referral();
-
-      expect(referralAfter).to.be.equal(referralBefore);
     });
   });
 });

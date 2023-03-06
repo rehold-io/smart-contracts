@@ -6,6 +6,7 @@ import {MockV3Aggregator} from "../typechain-types";
 const {BigNumber} = ethers;
 
 const AGGREGATOR_DECIMALS = 8;
+const e18 = BigNumber.from(10).pow(18);
 
 describe("price feed", () => {
   // We define a fixture to reuse the same setup in every test.
@@ -18,12 +19,14 @@ describe("price feed", () => {
     const btc = await Token.deploy("BTCB Token", "BTCB", 18);
     const usdt = await Token.deploy("Tether USD", "USDT", 6);
     const eth = await Token.deploy("Ethereum Token", "ETH", 18);
+    const gmt = await Token.deploy("GMT", "GMT", 8);
 
     const V3Aggregator = await ethers.getContractFactory("MockV3Aggregator");
 
     const aggregatorBTC = await V3Aggregator.deploy(AGGREGATOR_DECIMALS, 0);
     const aggregatorETH = await V3Aggregator.deploy(18, 0);
     const aggregatorUSDT = await V3Aggregator.deploy(AGGREGATOR_DECIMALS, 0);
+    const aggregatorGMT = await V3Aggregator.deploy(8, 0);
 
     const PriceFeed = await ethers.getContractFactory("PriceFeed");
     const priceFeed = await PriceFeed.deploy();
@@ -34,6 +37,7 @@ describe("price feed", () => {
       btc,
       eth,
       usdt,
+      gmt,
 
       owner,
       user,
@@ -41,6 +45,7 @@ describe("price feed", () => {
       aggregatorBTC: aggregatorBTC as MockV3Aggregator,
       aggregatorETH: aggregatorETH as MockV3Aggregator,
       aggregatorUSDT: aggregatorUSDT as MockV3Aggregator,
+      aggregatorGMT: aggregatorGMT as MockV3Aggregator,
     };
   };
 
@@ -114,34 +119,70 @@ describe("price feed", () => {
     });
   });
 
-  describe("currentPrice()", () => {
-    it("should get current price", async () => {
-      const {priceFeed, btc, eth, aggregatorBTC, aggregatorETH} = await loadFixture(deploy);
+  describe("decimals", () => {
+    it("GMT/USDT 6", async () => {
+      const {priceFeed, gmt, usdt, aggregatorGMT, aggregatorUSDT} = await loadFixture(deploy);
 
-      await priceFeed.updateAggregator(btc.address, aggregatorBTC.address);
-      await priceFeed.updateAggregator(eth.address, aggregatorETH.address);
+      await priceFeed.updateAggregator(gmt.address, aggregatorGMT.address);
+      await priceFeed.updateAggregator(usdt.address, aggregatorUSDT.address);
 
-      await aggregatorBTC.updateAnswer(BigNumber.from(10).pow(AGGREGATOR_DECIMALS).mul(19500));
-      await aggregatorETH.updateAnswer(BigNumber.from(10).pow(18).mul(1250));
+      await aggregatorGMT.updateAnswer(0.49 * 1e8);
+      await aggregatorUSDT.updateAnswer(1 * 1e8);
 
-      const priceBTC = await priceFeed.currentPrice(btc.address);
-      const priceETH = await priceFeed.currentPrice(eth.address);
-
-      expect(priceBTC).to.be.equal(BigNumber.from(10).pow(18).mul(19500));
-      expect(priceETH).to.be.equal(BigNumber.from(10).pow(18).mul(1250));
+      const price = await priceFeed.currentCrossPrice(gmt.address, usdt.address);
+      expect(price).eq(0.49 * 1e6);
     });
 
-    it("should get current price after update", async () => {
-      const {priceFeed, btc, aggregatorBTC} = await loadFixture(deploy);
+    it("GMT/BTC 18", async () => {
+      const {priceFeed, gmt, btc, aggregatorGMT, aggregatorBTC} = await loadFixture(deploy);
 
+      await priceFeed.updateAggregator(gmt.address, aggregatorGMT.address);
       await priceFeed.updateAggregator(btc.address, aggregatorBTC.address);
 
-      await aggregatorBTC.updateAnswer(19500 * 10 ** AGGREGATOR_DECIMALS);
-      await aggregatorBTC.updateAnswer(19600 * 10 ** AGGREGATOR_DECIMALS);
+      await aggregatorGMT.updateAnswer(0.49 * 1e8);
+      await aggregatorBTC.updateAnswer(23000 * 1e8);
 
-      const price = await priceFeed.currentPrice(btc.address);
+      const price = await priceFeed.currentCrossPrice(gmt.address, btc.address);
+      expect(price).eq(0.000021304347826086 * 1e18);
+    });
 
-      expect(price).to.be.equal(BigNumber.from(10).pow(18).mul(19600));
+    it("ETH/GMT 8", async () => {
+      const {priceFeed, gmt, eth, aggregatorGMT, aggregatorETH} = await loadFixture(deploy);
+
+      await priceFeed.updateAggregator(eth.address, aggregatorETH.address);
+      await priceFeed.updateAggregator(gmt.address, aggregatorGMT.address);
+
+      await aggregatorETH.updateAnswer(e18.mul(1519));
+      await aggregatorGMT.updateAnswer(0.49 * 1e8);
+
+      const price = await priceFeed.currentCrossPrice(eth.address, gmt.address);
+      expect(price).eq(3100 * 1e8);
+    });
+
+    it("ETH/USDT 6", async () => {
+      const {priceFeed, usdt, eth, aggregatorUSDT, aggregatorETH} = await loadFixture(deploy);
+
+      await priceFeed.updateAggregator(eth.address, aggregatorETH.address);
+      await priceFeed.updateAggregator(usdt.address, aggregatorUSDT.address);
+
+      await aggregatorETH.updateAnswer(e18.mul(1530));
+      await aggregatorUSDT.updateAnswer(1 * 1e8);
+
+      const price = await priceFeed.currentCrossPrice(eth.address, usdt.address);
+      expect(price).eq(1530 * 1e6);
+    });
+
+    it("ETH/BTC 18", async () => {
+      const {priceFeed, btc, eth, aggregatorBTC, aggregatorETH} = await loadFixture(deploy);
+
+      await priceFeed.updateAggregator(eth.address, aggregatorETH.address);
+      await priceFeed.updateAggregator(btc.address, aggregatorBTC.address);
+
+      await aggregatorETH.updateAnswer(e18.mul(1500));
+      await aggregatorBTC.updateAnswer(25000 * 1e8);
+
+      const price = await priceFeed.currentCrossPrice(eth.address, btc.address);
+      expect(price).eq(e18.mul(6).div(100));
     });
   });
 

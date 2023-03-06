@@ -4,8 +4,6 @@ pragma solidity ^0.8.17;
 import "@chainlink/contracts/src/v0.8/interfaces/AggregatorV2V3Interface.sol";
 
 interface IPriceFeed {
-  function decimals() external pure returns (uint256);
-
   struct Aggregator {
     AggregatorV2V3Interface aggregator;
     uint256 decimals;
@@ -18,8 +16,6 @@ interface IPriceFeed {
   }
 
   function currentCrossPrice(address baseToken, address quoteToken) external returns (uint256);
-
-  function currentPrice(address token) external returns (uint256);
 
   function historicalCrossPrice(
     address baseToken,

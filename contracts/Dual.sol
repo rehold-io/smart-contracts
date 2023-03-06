@@ -7,7 +7,6 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 
 import "./interfaces/IDual.sol";
 import "./interfaces/IPriceFeed.sol";
-import "./interfaces/IReferral.sol";
 import "./interfaces/IVault.sol";
 
 import "./libraries/math.sol";
@@ -16,7 +15,6 @@ contract DualFactory is AccessControl, IDualFactory {
   using SafeERC20 for ERC20;
 
   address public immutable WETH;
-  address public immutable USDT;
 
   mapping(uint256 => Dual) private _duals;
   uint32 public dualIndex;
@@ -24,50 +22,40 @@ contract DualFactory is AccessControl, IDualFactory {
   DualTariff[] private _tariffs;
   mapping(address => uint256[]) private _userDuals;
   address[] private _tokens;
-  mapping(address => Limit) private _limits;
   bool public enabled;
 
   IPriceFeed public priceFeed;
-  IReferral public referral;
   IVault public vault;
 
-  constructor(IVault _vault, IPriceFeed _priceFeed, IReferral _referral, address _WETH, address _USDT) {
+  constructor(IVault _vault, IPriceFeed _priceFeed, address _WETH) {
     _grantRole(DEFAULT_ADMIN_ROLE, msg.sender);
 
     vault = _vault;
     priceFeed = _priceFeed;
-    referral = _referral;
     WETH = _WETH;
-    USDT = _USDT;
 
     dualIndex = 0;
     enabled = true;
   }
 
-  function create(
-    uint256 tariffId,
-    address _user,
-    address inputToken,
-    uint256 inputAmount,
-    address inviterAddress
-  ) public {
+  function create(uint256 tariffId, address _user, address inputToken, uint256 inputAmount) public {
     require(msg.sender == _user || hasRole(DEFAULT_ADMIN_ROLE, msg.sender), "Dual: Not Allowed");
 
     DualTariff memory tariff = _tariffs[tariffId];
 
     _validate(tariff, inputToken, inputAmount);
     vault.depositTokens(inputToken, _user, inputAmount);
-    _create(tariff, _user, inputToken, inputAmount, inviterAddress);
+    _create(tariff, _user, inputToken, inputAmount);
   }
 
-  function createETH(uint256 tariffId, address inviterAddress) public payable {
+  function createETH(uint256 tariffId) public payable {
     DualTariff memory tariff = _tariffs[tariffId];
     address inputToken = address(WETH);
     uint256 inputAmount = msg.value;
 
     _validate(tariff, inputToken, inputAmount);
     vault.deposit{value: msg.value}();
-    _create(tariff, msg.sender, inputToken, inputAmount, inviterAddress);
+    _create(tariff, msg.sender, inputToken, inputAmount);
   }
 
   function replay(uint256 id, uint256 tariffId, uint80 baseRoundId, uint80 quoteRoundId) public {
@@ -82,7 +70,7 @@ contract DualFactory is AccessControl, IDualFactory {
     }
 
     _validate(tariff, inputToken, inputAmount);
-    _create(tariff, dual.user, inputToken, inputAmount, address(0x0));
+    _create(tariff, dual.user, inputToken, inputAmount);
 
     emit DualReplayed(id);
   }
@@ -92,19 +80,16 @@ contract DualFactory is AccessControl, IDualFactory {
     require(inputToken == tariff.baseToken || inputToken == tariff.quoteToken, "Dual: Input must be one from pair");
     require(tariff.enabled, "Dual: Tariff does not exist");
 
-    Limit memory limit = _limits[inputToken];
-
-    require(inputAmount >= limit.minAmount, "Dual: Too small input amount");
-    require(inputAmount <= limit.maxAmount, "Dual: Exceeds maximum input amount");
+    if (tariff.baseToken == inputToken) {
+      require(inputAmount >= tariff.minBaseAmount, "Dual: Too small input amount");
+      require(inputAmount <= tariff.maxBaseAmount, "Dual: Exceeds maximum input amount");
+    } else {
+      require(inputAmount >= tariff.minQuoteAmount, "Dual: Too small input amount");
+      require(inputAmount <= tariff.maxQuoteAmount, "Dual: Exceeds maximum input amount");
+    }
   }
 
-  function _create(
-    DualTariff memory tariff,
-    address _user,
-    address inputToken,
-    uint256 inputAmount,
-    address inviterAddress
-  ) private {
+  function _create(DualTariff memory tariff, address _user, address inputToken, uint256 inputAmount) private {
     uint256 initialPrice = priceFeed.currentCrossPrice(tariff.baseToken, tariff.quoteToken);
 
     Dual memory dual;
@@ -120,12 +105,6 @@ contract DualFactory is AccessControl, IDualFactory {
     }
 
     _duals[dualIndex] = dual;
-
-    uint256 inputAmountUSDT = _convertToUSDT(inputToken, inputAmount);
-    uint256 profitUSDT = Math.percent(inputAmountUSDT, tariff.yield);
-
-    referral.earn(_user, profitUSDT, inviterAddress);
-
     _userDuals[_user].push(dualIndex);
 
     emit DualCreated(dualIndex);
@@ -166,10 +145,6 @@ contract DualFactory is AccessControl, IDualFactory {
     );
 
     emit DualClaimed(id);
-  }
-
-  function _convertToUSDT(address inputToken, uint256 inputAmount) private returns (uint256) {
-    return (inputAmount * priceFeed.currentCrossPrice(inputToken, USDT)) / 10 ** priceFeed.decimals();
   }
 
   function get(uint256 id) public view returns (Dual memory dual) {
@@ -390,28 +365,6 @@ contract DualFactory is AccessControl, IDualFactory {
     return dt2;
   }
 
-  function limits() public view returns (TokenLimit[] memory tokenLimits) {
-    tokenLimits = new TokenLimit[](_tokens.length);
-
-    for (uint32 i = 0; i < _tokens.length; i++) {
-      TokenLimit memory tl;
-
-      tl.token = _tokens[i];
-      tl.minAmount = _limits[tl.token].minAmount;
-      tl.maxAmount = _limits[tl.token].maxAmount;
-
-      tokenLimits[i] = tl;
-    }
-  }
-
-  function updateLimits(address token, Limit calldata limit) public onlyRole(DEFAULT_ADMIN_ROLE) {
-    if (_limits[token].minAmount == 0) {
-      _tokens.push(token);
-    }
-
-    _limits[token] = limit;
-  }
-
   function enable() public onlyRole(DEFAULT_ADMIN_ROLE) {
     enabled = true;
   }
@@ -421,14 +374,12 @@ contract DualFactory is AccessControl, IDualFactory {
   }
 
   function updateVault(IVault _vault) public onlyRole(DEFAULT_ADMIN_ROLE) {
+    emit VaultUpdated(address(vault), address(_vault));
     vault = _vault;
   }
 
   function updatePriceFeed(IPriceFeed _priceFeed) public onlyRole(DEFAULT_ADMIN_ROLE) {
+    emit PriceFeedUpdated(address(priceFeed), address(_priceFeed));
     priceFeed = _priceFeed;
-  }
-
-  function updateReferral(IReferral _referral) public onlyRole(DEFAULT_ADMIN_ROLE) {
-    referral = _referral;
   }
 }

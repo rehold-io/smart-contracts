@@ -8,8 +8,7 @@ import "@openzeppelin/contracts/access/AccessControl.sol";
 import "./interfaces/IPriceFeed.sol";
 
 contract PriceFeed is AccessControl, IPriceFeed {
-  uint256 public constant decimals = 18;
-  uint256 private constant _decimals = 10 ** decimals;
+  uint256 private constant DECIMALS = 18;
 
   mapping(address => Aggregator) private _aggregators;
   address[] private _tokens;
@@ -26,11 +25,6 @@ contract PriceFeed is AccessControl, IPriceFeed {
     uint256 quotePrice = uint256(quotePriceFeed.aggregator.latestAnswer());
 
     return _crossPrice(basePrice, basePriceFeed, quotePrice, quotePriceFeed);
-  }
-
-  function currentPrice(address token) public view returns (uint256) {
-    Aggregator memory agg = _aggregators[token];
-    return _scalePrice(uint256(agg.aggregator.latestAnswer()), agg.decimals);
   }
 
   function historicalCrossPrice(
@@ -51,11 +45,11 @@ contract PriceFeed is AccessControl, IPriceFeed {
 
     require(
       baseStartedAt != 0 &&
-        quoteStartedAt != 0 &&
-        baseStartedAt <= timestamp &&
-        quoteStartedAt <= timestamp &&
-        (nextBaseStartedAt == 0 || nextBaseStartedAt >= timestamp) &&
-        (nextQuoteStartedAt == 0 || nextQuoteStartedAt >= timestamp),
+      quoteStartedAt != 0 &&
+      baseStartedAt <= timestamp &&
+      quoteStartedAt <= timestamp &&
+      (nextBaseStartedAt == 0 || nextBaseStartedAt >= timestamp) &&
+      (nextQuoteStartedAt == 0 || nextQuoteStartedAt >= timestamp),
       "PriceFeed: Out of range"
     );
 
@@ -68,22 +62,16 @@ contract PriceFeed is AccessControl, IPriceFeed {
     uint256 quotePrice,
     Aggregator memory quotePriceFeed
   ) private pure returns (uint256) {
-    // optimization for 18
-    if (
-      basePriceFeed.decimals == quotePriceFeed.decimals && basePriceFeed.tokenDecimals == quotePriceFeed.tokenDecimals
-    ) {
-      return (basePrice * _decimals) / quotePrice;
-    }
 
     basePrice = _scalePrice(basePrice, basePriceFeed.decimals);
     quotePrice = _scalePrice(quotePrice, quotePriceFeed.decimals);
 
-    return (basePrice * _decimals * 10 ** quotePriceFeed.tokenDecimals) / quotePrice / 10 ** basePriceFeed.tokenDecimals;
+    return (basePrice * 10 ** quotePriceFeed.tokenDecimals) / quotePrice;
   }
 
   function _scalePrice(uint256 price, uint256 priceDecimals) private pure returns (uint256) {
-    if (priceDecimals < decimals) {
-      return price * (10 ** (decimals - priceDecimals));
+    if (priceDecimals < DECIMALS) {
+      return price * (10 ** (DECIMALS - priceDecimals));
     }
 
     return price;
