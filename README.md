@@ -20,6 +20,11 @@ Audited by [PeckShield](https://github.com/peckshield/publications/blob/master/a
 * **Referral** - referral earnings and claims (https://bscscan.com/address/0x868A943ca49A63eB0456a00AE098D470915EEA0D);
 * **Price Feed** - interacting with price oracles by Chainlink (https://bscscan.com/address/0x6339329BB0558047caCD8Df4312fE6b1c9F47b59).
 
+## NFTs on Binance Smart Chain (BSC)
+
+* **Early Adopter** - opened at least one dual during a Private Launch (https://bscscan.com/address/0xfc9056fa7923e1f3e182ae29f251a95108f1cddf)
+* **Gold Early Adopter** - invited at least one friend during a Private Launch (https://bscscan.com/address/0x0b75014f102163b0e86f6f93a12f860a291d8933)
+
 ## Compile
 
 ```sh
