@@ -42,15 +42,18 @@ const config: HardhatUserConfig = {
     ],
   },
   etherscan: {
-    apiKey: process.env.ETHERSCAN_API_KEY as string,
+    apiKey: {
+      bsc: process.env.BSCSCAN_API_KEY as string,
+      polygon: process.env.POLYGONSCAN_API_KEY as string,
+    },
   },
   networks: {
-    mainnet: {
+    bsc: {
       url: "https://rpc.ankr.com/bsc",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
     },
-    bsctest: {
-      url: "https://bsc-testnet.public.blastapi.io",
+    polygon: {
+      url: "https://rpc.ankr.com/polygon",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
     },
   },
