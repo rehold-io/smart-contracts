@@ -41,7 +41,8 @@ contract Vault is AccessControl, IVault {
   }
 
   function _withdraw(address payable to, uint256 amount) private {
-    require(to.send(amount), "Vault: Sending ETH has been failed");
+    (bool success,) = to.call{value: amount}("");
+    require(success, "Vault: Sending ETH has been failed");
   }
 
   function depositTokens(address token, address from, uint256 amount) external onlyRole(DEFAULT_ADMIN_ROLE) {

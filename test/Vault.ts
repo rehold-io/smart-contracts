@@ -13,13 +13,16 @@ describe("vault", () => {
     const Token = await ethers.getContractFactory("Token");
     const token = await Token.deploy("Tether USD", "USDT", 6);
 
+    const PayableContract = await ethers.getContractFactory("PayableContract");
+    const payableContract = await PayableContract.deploy(user.address);
+
     const WETH = await ethers.getContractFactory("WETH");
     const weth = await WETH.deploy();
 
     const Vault = await ethers.getContractFactory("Vault");
     const vault = await Vault.deploy(weth.address);
 
-    return {vault, token, weth, owner, user};
+    return {vault, token, payableContract, weth, owner, user};
   };
 
   describe("constructor()", () => {
@@ -500,6 +503,30 @@ describe("vault", () => {
       const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
 
       await vault.withdraw(user.address, parseEther("0.5"));
+
+      const userBalanceAfter = await ethers.provider.getBalance(user.address);
+      const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
+
+      expect(vaultBalanceBefore).to.be.equal(parseEther("1"));
+      expect(vaultBalanceAfter).to.be.equal(parseEther("0.5"));
+
+      expect(userBalanceAfter).to.be.equal(userBalanceBefore.add(parseEther("0.5")));
+    });
+
+    it("should withdraw eth to the contract with some logic on its side", async () => {
+      const {vault, user, weth, payableContract} = await loadFixture(deploy);
+
+      await vault.updateThreshold(weth.address, parseEther("1"));
+
+      // top up vault to be sure here's enough funds to withdraw
+      await vault.deposit({
+        value: parseEther("1"),
+      });
+
+      const userBalanceBefore = await ethers.provider.getBalance(user.address);
+      const vaultBalanceBefore = await ethers.provider.getBalance(vault.address);
+
+      await vault.withdraw(payableContract.address, parseEther("0.5"));
 
       const userBalanceAfter = await ethers.provider.getBalance(user.address);
       const vaultBalanceAfter = await ethers.provider.getBalance(vault.address);
