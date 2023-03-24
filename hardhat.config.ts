@@ -45,6 +45,7 @@ const config: HardhatUserConfig = {
     apiKey: {
       bsc: process.env.BSCSCAN_API_KEY as string,
       polygon: process.env.POLYGONSCAN_API_KEY as string,
+      avalanche: process.env.SNOWTRACE_API_KEY as string,
     },
   },
   networks: {
@@ -54,6 +55,10 @@ const config: HardhatUserConfig = {
     },
     polygon: {
       url: "https://rpc.ankr.com/polygon",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
+    },
+    avalanche: {
+      url: "https://rpc.ankr.com/avalanche",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
     },
   },
