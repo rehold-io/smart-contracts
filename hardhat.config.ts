@@ -46,6 +46,7 @@ const config: HardhatUserConfig = {
       bsc: process.env.BSCSCAN_API_KEY as string,
       polygon: process.env.POLYGONSCAN_API_KEY as string,
       avalanche: process.env.SNOWTRACE_API_KEY as string,
+      opera: process.env.FTMSCAN_API_KEY as string,
     },
   },
   networks: {
@@ -59,6 +60,10 @@ const config: HardhatUserConfig = {
     },
     avalanche: {
       url: "https://rpc.ankr.com/avalanche",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
+    },
+    opera: {
+      url: "https://rpc.ankr.com/fantom",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
     },
   },
