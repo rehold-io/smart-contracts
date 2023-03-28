@@ -47,6 +47,7 @@ const config: HardhatUserConfig = {
       polygon: process.env.POLYGONSCAN_API_KEY as string,
       avalanche: process.env.SNOWTRACE_API_KEY as string,
       opera: process.env.FTMSCAN_API_KEY as string,
+      optimisticEthereum: process.env.OPTIMISTICSCAN_API_KEY as string,
     },
   },
   networks: {
@@ -64,6 +65,10 @@ const config: HardhatUserConfig = {
     },
     opera: {
       url: "https://rpc.ankr.com/fantom",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
+    },
+    optimisticEthereum: {
+      url: "https://rpc.ankr.com/optimism",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
     },
   },
