@@ -44,6 +44,7 @@ const config: HardhatUserConfig = {
   etherscan: {
     apiKey: {
       bsc: process.env.BSCSCAN_API_KEY as string,
+      arbitrumOne: process.env.ARBISCAN_API_KEY as string,
       polygon: process.env.POLYGONSCAN_API_KEY as string,
       avalanche: process.env.SNOWTRACE_API_KEY as string,
       opera: process.env.FTMSCAN_API_KEY as string,
@@ -53,6 +54,10 @@ const config: HardhatUserConfig = {
   networks: {
     bsc: {
       url: "https://rpc.ankr.com/bsc",
+      accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
+    },
+    arbitrumOne: {
+      url: "https://rpc.ankr.com/arbitrum",
       accounts: process.env.PRIVATE_KEY ? [process.env.PRIVATE_KEY as string] : undefined,
     },
     polygon: {

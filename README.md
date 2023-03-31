@@ -20,6 +20,12 @@ Audited by [PeckShield](https://github.com/peckshield/publications/blob/master/a
 * **Referral** - referral earnings and claims (https://bscscan.com/address/0x868A943ca49A63eB0456a00AE098D470915EEA0D);
 * **Price Feed** - interacting with price oracles by Chainlink (https://bscscan.com/address/0x6339329BB0558047caCD8Df4312fE6b1c9F47b59).
 
+## Contracts on Arbitrum (ARB)
+
+* **Dual Factory** - interacting with duals: creating, claiming, and replaying (https://arbiscan.io/address/0x868A943ca49A63eB0456a00AE098D470915EEA0D);
+* **Vault** - all money operations for creating & claiming duals and referral program claims (https://arbiscan.io/address/0xd476ce848C61650E3051f7571f3Ae437Fe9A32E0);
+* **Price Feed** - interacting with price oracles by Chainlink (https://arbiscan.io/address/0x6339329BB0558047caCD8Df4312fE6b1c9F47b59).
+
 ## Contracts on Polygon (MATIC)
 
 * **Dual Factory** - interacting with duals: creating, claiming, and replaying (https://polygonscan.com/address/0x868A943ca49A63eB0456a00AE098D470915EEA0D);
